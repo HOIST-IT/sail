@@ -16,7 +16,7 @@ from urllib.request import url2pathname
 from pyiceberg.avro.file import AvroFile
 from pyiceberg.io.pyarrow import PyArrowFile, PyArrowFileIO
 from pyiceberg.manifest import MANIFEST_LIST_FILE_SCHEMAS, ManifestContent, PartitionFieldSummary
-from pyspark.sql import Row
+from pyspark.sql import Row, functions as F
 from pytest_bdd import given, parsers, then
 
 from pysail.testing.spark.steps.delta import _get_by_path, _parse_expected_value
@@ -396,6 +396,25 @@ def append_query_to_iceberg_table_with_merge_schema(
         "mergeSchema",
         "true",
     ).save(location.path.absolute().as_uri())
+
+
+@given(parsers.parse("overwrite query into iceberg table {table_name} where {predicate}"))
+def overwrite_query_into_iceberg_table(
+    table_name: str,
+    predicate: str,
+    docstring: str,
+    spark,
+) -> None:
+    spark.sql(docstring).writeTo(table_name).overwrite(F.expr(predicate))
+
+
+@given(parsers.parse("overwrite partitions of iceberg table {table_name} with query"))
+def overwrite_partitions_of_iceberg_table(
+    table_name: str,
+    docstring: str,
+    spark,
+) -> None:
+    spark.sql(docstring).writeTo(table_name).overwritePartitions()
 
 
 def _sanitize_iceberg_metadata(metadata: dict) -> dict:
