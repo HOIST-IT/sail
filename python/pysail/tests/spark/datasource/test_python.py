@@ -5,6 +5,7 @@ These tests verify the Python DataSource API works correctly with Sail,
 including both Arrow RecordBatch and tuple-based paths.
 """
 
+import contextlib
 import json
 from collections.abc import Iterator
 from pathlib import Path
@@ -578,6 +579,81 @@ def test_python_exception_handling(spark):
 
     with pytest.raises(Exception, match=r"[Dd]eliberate test exception"):
         df.collect()
+
+
+@pytest.mark.parametrize(
+    ("failure_kind", "expected_type", "expected_message"),
+    [
+        ("terminal", "AnalysisException", "Python data source reported a terminal failure"),
+        ("transient", "SparkRuntimeException", "Python data source reported a transient failure"),
+    ],
+)
+def test_python_declared_failure_kind_is_structured_and_message_free(
+    failure_kind: str, expected_type: str, expected_message: str
+):
+    """A declared failure crosses Spark Connect by finite class, not Python text."""
+    import pyarrow as pa
+    from pyspark import errors
+    from pyspark.sql import SparkSession
+    from pyspark.sql.datasource import DataSource, DataSourceReader, InputPartition
+
+    import pysail.spark
+
+    class DeclaredDataSourceError(Exception):
+        __sail_data_source_failure_kind__ = failure_kind
+
+        def __getattribute__(self, name: str):
+            if name == "__sail_data_source_failure_kind__":
+                return "masked-on-instance"
+            return super().__getattribute__(name)
+
+    private_detail = "detail that must not cross the boundary"
+
+    def direct_read(_reader, _partition):
+        raise DeclaredDataSourceError(private_detail)
+
+    def generator_read(_reader, _partition):
+        raise DeclaredDataSourceError(private_detail)
+        yield (0,)  # pragma: no cover - makes this a generator like streaming readers
+
+    class DeclaredFailureReader(DataSourceReader):
+        read = direct_read if failure_kind == "terminal" else generator_read
+
+        def partitions(self):
+            return [InputPartition(0)]
+
+    class DeclaredFailureDataSource(DataSource):
+        @classmethod
+        def name(cls) -> str:
+            return f"declared_failure_{failure_kind}"
+
+        def schema(self):
+            return pa.schema([("id", pa.int32())])
+
+        def reader(self, schema):  # noqa: ARG002
+            return DeclaredFailureReader()
+
+    server = pysail.spark.SparkConnectServer("127.0.0.1", 0)
+    server.start()
+    host, port = server.listening_address
+    spark = SparkSession.builder.remote(f"sc://{host}:{port}").create()
+    try:
+        spark.conf.set("spark.sql.session.localRelationSizeLimit", "3g")
+        spark.dataSource.register(DeclaredFailureDataSource)
+        frame = spark.read.format(DeclaredFailureDataSource.name()).load()
+        exception_type = getattr(errors, expected_type)
+
+        with pytest.raises(exception_type) as caught:
+            frame.collect()
+        assert expected_message in str(caught.value)
+        assert private_detail not in str(caught.value)
+        assert caught.value.__cause__ is None
+        assert private_detail not in repr(caught.value.__context__)
+    finally:
+        with contextlib.suppress(Exception):
+            spark.stop()
+        with contextlib.suppress(Exception):
+            server.stop()
 
 
 def test_python_session_isolation(remote: str):
