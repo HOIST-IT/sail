@@ -248,8 +248,10 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+    use crate::spec::types::values::PrimitiveLiteral;
+    use crate::spec::types::{NestedField, PrimitiveType, Type};
     use crate::spec::{
-        DataContentType, DataFileFormat, ManifestContentType, PartitionSpec, Schema,
+        DataContentType, DataFileFormat, Datum, ManifestContentType, PartitionSpec, Schema,
     };
 
     fn data_file(path: &str, record_count: u64) -> DataFile {
@@ -326,6 +328,89 @@ mod tests {
         assert_eq!(manifest_file.existing_rows_count, Some(3));
         assert_eq!(manifest_file.deleted_rows_count, Some(3));
         assert_eq!(manifest_file.min_sequence_number, 1);
+    }
+
+    #[test]
+    fn typed_metric_bounds_survive_manifest_roundtrip() {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::optional(
+                    1,
+                    "amount",
+                    Type::Primitive(PrimitiveType::Decimal {
+                        precision: 10,
+                        scale: 2,
+                    }),
+                )),
+                Arc::new(NestedField::optional(
+                    2,
+                    "identifier",
+                    Type::Primitive(PrimitiveType::Uuid),
+                )),
+                Arc::new(NestedField::optional(
+                    3,
+                    "fixed",
+                    Type::Primitive(PrimitiveType::Fixed(3)),
+                )),
+                Arc::new(NestedField::optional(
+                    4,
+                    "binary",
+                    Type::Primitive(PrimitiveType::Binary),
+                )),
+            ])
+            .build()
+            .unwrap();
+        let metadata = ManifestMetadata::new(
+            Arc::new(schema),
+            0,
+            PartitionSpec::unpartitioned_spec(),
+            FormatVersion::V2,
+            ManifestContentType::Data,
+        );
+        let expected = HashMap::from([
+            (
+                1,
+                Datum::new(
+                    PrimitiveType::Decimal {
+                        precision: 10,
+                        scale: 2,
+                    },
+                    PrimitiveLiteral::Int128(-12_345),
+                ),
+            ),
+            (
+                2,
+                Datum::new(
+                    PrimitiveType::Uuid,
+                    PrimitiveLiteral::UInt128(0x0011_2233_4455_6677_8899_aabb_ccdd_eeff),
+                ),
+            ),
+            (
+                3,
+                Datum::new(
+                    PrimitiveType::Fixed(3),
+                    PrimitiveLiteral::Binary(vec![1, 2, 3]),
+                ),
+            ),
+            (
+                4,
+                Datum::new(
+                    PrimitiveType::Binary,
+                    PrimitiveLiteral::Binary(vec![4, 5, 6]),
+                ),
+            ),
+        ]);
+        let mut file = data_file("data/typed.parquet", 1);
+        file.lower_bounds = expected.clone();
+        file.upper_bounds = expected.clone();
+        let mut writer = ManifestWriterBuilder::new(Some(20), None, metadata).build();
+        writer.add(file);
+
+        let bytes = writer.to_avro_bytes_v2().unwrap();
+        let manifest = Manifest::parse_avro(&bytes).unwrap();
+
+        assert_eq!(manifest.entries[0].data_file.lower_bounds, expected);
+        assert_eq!(manifest.entries[0].data_file.upper_bounds, expected);
     }
 
     #[test]
