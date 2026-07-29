@@ -10,6 +10,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -36,23 +37,26 @@ use crate::catalog_support::commit::{
     CatalogCommitOutcome, CatalogTableInfo, IcebergCatalogCommitCoordinator,
     IcebergCatalogCommitMode, catalog_requirements, table_metadata_location,
 };
-use crate::io::StoreContext;
+use crate::io::{StoreContext, load_manifest, load_manifest_list};
 use crate::operations::bootstrap::{
     NewTableMetadataStyle, PersistStrategy, bootstrap_first_snapshot,
     bootstrap_new_table_with_style, bootstrap_snapshot_action_commit,
 };
 use crate::operations::helpers::format_version_for_schema;
 use crate::operations::{
-    DeleteFilesOperation, SnapshotProduceOperation, Transaction, TransactionAction,
+    DeleteFilesOperation, RewriteFilesOperation, SnapshotProduceOperation, Transaction,
+    TransactionAction,
 };
 use crate::physical_plan::action_schema::{CommitMeta, decode_actions_and_meta_from_batch};
 use crate::physical_plan::commit::IcebergCommitInfo;
 use crate::spec::catalog::TableUpdate;
+use crate::spec::manifest::ManifestStatus;
 use crate::spec::metadata::table_metadata::SnapshotLog;
 use crate::spec::partition::{UnboundPartitionField, UnboundPartitionSpec};
 use crate::spec::snapshots::MAIN_BRANCH;
 use crate::spec::{
-    Operation, PartitionSpec, Schema as IcebergSchema, TableMetadata, TableRequirement,
+    DataContentType, DataFile, Operation, PartitionSpec, Schema as IcebergSchema, TableMetadata,
+    TableRequirement,
 };
 use crate::table::metadata_loader::{
     encode_metadata_file, load_metadata_file_bytes, metadata_file_extension_from_properties,
@@ -404,6 +408,77 @@ impl IcebergCommitExec {
         table_metadata_location(table_url, metadata_file)
     }
 
+    async fn current_live_data_files(
+        store_ctx: &StoreContext,
+        table_metadata: &TableMetadata,
+    ) -> Result<Vec<DataFile>> {
+        let Some(snapshot) = table_metadata.current_snapshot() else {
+            return Ok(vec![]);
+        };
+        let manifest_list = load_manifest_list(store_ctx, snapshot.manifest_list()).await?;
+        let mut live_data_files = vec![];
+        for manifest_file in manifest_list.entries() {
+            let manifest = load_manifest(store_ctx, &manifest_file.manifest_path).await?;
+            for entry in manifest.entries().iter().filter(|entry| {
+                matches!(
+                    entry.status,
+                    ManifestStatus::Added | ManifestStatus::Existing
+                )
+            }) {
+                if !matches!(entry.data_file.content, DataContentType::Data) {
+                    return Err(DataFusionError::Plan(
+                        "copy-on-write dynamic partition overwrite is not supported for Iceberg tables with active delete files"
+                            .to_string(),
+                    ));
+                }
+                live_data_files.push(entry.data_file.clone());
+            }
+        }
+        Ok(live_data_files)
+    }
+
+    fn dynamic_partition_overwrite_paths(
+        added_data_files: &[DataFile],
+        live_data_files: &[DataFile],
+        default_spec: &PartitionSpec,
+    ) -> Result<Vec<String>> {
+        if added_data_files.is_empty() {
+            return Ok(vec![]);
+        }
+        let default_spec_id = default_spec.spec_id();
+        let partition_field_count = default_spec.fields().len();
+        if added_data_files.iter().any(|data_file| {
+            data_file.partition_spec_id != default_spec_id
+                || data_file.partition.len() != partition_field_count
+        }) {
+            return Err(DataFusionError::Plan(format!(
+                "dynamic partition overwrite produced files that do not match the default Iceberg partition spec {default_spec_id}"
+            )));
+        }
+        if live_data_files.iter().any(|data_file| {
+            data_file.partition_spec_id != default_spec_id
+                || data_file.partition.len() != partition_field_count
+        }) {
+            return Err(DataFusionError::NotImplemented(
+                "dynamic partition overwrite is not supported for Iceberg tables with incomparable live partition specs"
+                    .to_string(),
+            ));
+        }
+
+        let touched_partitions = added_data_files
+            .iter()
+            .map(|data_file| data_file.partition.clone())
+            .collect::<HashSet<_>>();
+        let mut paths = live_data_files
+            .iter()
+            .filter(|data_file| touched_partitions.contains(&data_file.partition))
+            .map(|data_file| data_file.file_path.clone())
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
+    }
+
     fn merge_writer_commit_meta(
         accumulated: &mut Option<CommitMeta>,
         mut incoming: CommitMeta,
@@ -534,6 +609,8 @@ impl ExecutionPlan for IcebergCommitExec {
                 )
             })?;
 
+            let is_scoped_rewrite = operation_override.is_some();
+            let dynamic_partition_overwrite = commit_meta.dynamic_partition_overwrite;
             let mut commit_info = IcebergCommitInfo {
                 table_uri: commit_meta.table_uri,
                 row_count: commit_meta.row_count,
@@ -553,6 +630,15 @@ impl ExecutionPlan for IcebergCommitExec {
                 &mut commit_info.requirements,
                 expected_snapshot_id,
             );
+            if dynamic_partition_overwrite
+                && (!is_scoped_rewrite
+                    || !matches!(commit_info.operation, Operation::Overwrite)
+                    || !commit_info.files_to_remove.is_empty())
+            {
+                return Err(DataFusionError::Internal(
+                    "invalid dynamic partition overwrite commit carrier".to_string(),
+                ));
+            }
 
             let catalog_table = commit_info
                 .lakehouse_table
@@ -609,6 +695,17 @@ impl ExecutionPlan for IcebergCommitExec {
                 catalog_metadata_location,
                 catalog_commit_mode
             );
+
+            if latest_meta_res.is_err()
+                && is_scoped_rewrite
+                && commit_info.data_files.is_empty()
+                && commit_info.files_to_remove.is_empty()
+            {
+                Self::validate_requirements(None, &commit_info.requirements)?;
+                let array = Arc::new(UInt64Array::from(vec![0u64]));
+                let batch = RecordBatch::try_new(schema, vec![array])?;
+                return Ok(batch);
+            }
 
             if latest_meta_res.is_err()
                 && (matches!(commit_info.operation, crate::spec::Operation::Overwrite)
@@ -691,12 +788,27 @@ impl ExecutionPlan for IcebergCommitExec {
                 let mut table_meta = TableMetadata::from_json(&bytes)
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
                 Self::validate_requirements(Some(&table_meta), &commit_info.requirements)?;
-                if matches!(commit_info.operation, Operation::Delete)
+                if is_scoped_rewrite
+                    && commit_info.data_files.is_empty()
                     && commit_info.files_to_remove.is_empty()
                 {
                     let array = Arc::new(UInt64Array::from(vec![0u64]));
                     let batch = RecordBatch::try_new(schema, vec![array])?;
                     return Ok(batch);
+                }
+                if dynamic_partition_overwrite {
+                    let default_spec = table_meta.default_partition_spec().ok_or_else(|| {
+                        DataFusionError::Plan(
+                            "Iceberg table metadata has no default partition spec".to_string(),
+                        )
+                    })?;
+                    let live_data_files =
+                        Self::current_live_data_files(&store_ctx, &table_meta).await?;
+                    commit_info.files_to_remove = Self::dynamic_partition_overwrite_paths(
+                        &commit_info.data_files,
+                        &live_data_files,
+                        default_spec,
+                    )?;
                 }
                 let original_format_version = table_meta.format_version;
                 let mut metadata_updates = Vec::new();
@@ -941,16 +1053,25 @@ impl ExecutionPlan for IcebergCommitExec {
                             Some(manifest_meta),
                         )
                         .with_row_lineage_start_row_id(row_lineage_start_row_id);
-                        struct LocalOverwriteOperation;
-                        impl SnapshotProduceOperation for LocalOverwriteOperation {
-                            fn operation(&self) -> &'static str {
-                                "overwrite"
+                        if is_scoped_rewrite {
+                            producer
+                                .commit(RewriteFilesOperation::new(
+                                    commit_info.files_to_remove.clone(),
+                                ))
+                                .await
+                                .map_err(DataFusionError::Execution)?
+                        } else {
+                            struct LocalOverwriteOperation;
+                            impl SnapshotProduceOperation for LocalOverwriteOperation {
+                                fn operation(&self) -> &'static str {
+                                    "overwrite"
+                                }
                             }
+                            producer
+                                .commit(LocalOverwriteOperation)
+                                .await
+                                .map_err(DataFusionError::Execution)?
                         }
-                        producer
-                            .commit(LocalOverwriteOperation)
-                            .await
-                            .map_err(DataFusionError::Execution)?
                     }
                     crate::spec::Operation::Delete => {
                         let producer = crate::operations::SnapshotProducer::new(
@@ -1234,8 +1355,17 @@ mod tests {
     use object_store::memory::InMemory;
 
     use super::*;
-    use crate::physical_plan::action_schema::{encode_commit_meta, iceberg_action_schema};
-    use crate::spec::FormatVersion;
+    use crate::io::{load_manifest, load_manifest_list};
+    use crate::physical_plan::action_schema::{
+        encode_add_data_files, encode_commit_meta, iceberg_action_schema,
+    };
+    use crate::spec::manifest::{ManifestMetadata, ManifestStatus, ManifestWriterBuilder};
+    use crate::spec::transform::Transform;
+    use crate::spec::types::{NestedField, PrimitiveType, Type};
+    use crate::spec::{
+        FormatVersion, ManifestContentType, ManifestListWriter, PartitionSpec,
+        Schema as IcebergSchema, Snapshot, SnapshotBuilder,
+    };
 
     fn table_metadata_at_snapshot(snapshot_id: Option<i64>) -> TableMetadata {
         TableMetadata {
@@ -1263,6 +1393,316 @@ mod tests {
             statistics: vec![],
             partition_statistics: vec![],
         }
+    }
+
+    fn partitioned_data_file(path: &str, spec_id: i32, value: i32) -> crate::spec::DataFile {
+        crate::spec::DataFile {
+            content: crate::spec::DataContentType::Data,
+            file_path: path.to_string(),
+            file_format: crate::spec::DataFileFormat::Parquet,
+            partition: vec![Some(crate::spec::types::values::Literal::Primitive(
+                crate::spec::types::values::PrimitiveLiteral::Int(value),
+            ))],
+            record_count: 1,
+            file_size_in_bytes: 1,
+            column_sizes: HashMap::new(),
+            value_counts: HashMap::new(),
+            null_value_counts: HashMap::new(),
+            nan_value_counts: HashMap::new(),
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
+            block_size_in_bytes: None,
+            key_metadata: None,
+            split_offsets: vec![],
+            equality_ids: vec![],
+            sort_order_id: None,
+            first_row_id: None,
+            partition_spec_id: spec_id,
+            referenced_data_file: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+        }
+    }
+
+    fn partitioned_schema() -> IcebergSchema {
+        IcebergSchema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                Arc::new(NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Long),
+                )),
+                Arc::new(NestedField::required(
+                    2,
+                    "part",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+            ])
+            .build()
+            .expect("valid partitioned schema")
+    }
+
+    fn partition_spec() -> PartitionSpec {
+        PartitionSpec::builder()
+            .with_spec_id(3)
+            .add_field(2, "part", Transform::Identity)
+            .build()
+    }
+
+    fn commit_input(
+        table_url: &Url,
+        data_files: Vec<DataFile>,
+        operation: Operation,
+        dynamic_partition_overwrite: bool,
+        schema: Option<IcebergSchema>,
+        partition_spec: Option<PartitionSpec>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let row_count = data_files
+            .iter()
+            .map(|data_file| data_file.record_count)
+            .sum();
+        let batches = vec![
+            encode_add_data_files(data_files)?,
+            encode_commit_meta(CommitMeta {
+                table_uri: table_url.to_string(),
+                row_count,
+                operation,
+                requirements: vec![],
+                table_properties: vec![],
+                lakehouse_table: None,
+                schema,
+                partition_spec,
+                dynamic_partition_overwrite,
+            })?,
+        ];
+        let input: Arc<dyn ExecutionPlan> =
+            MemorySourceConfig::try_new_from_batches(iceberg_action_schema()?, batches)?;
+        Ok(input)
+    }
+
+    async fn current_snapshot_id(context: &SessionContext, table_url: &Url) -> Result<i64> {
+        let state = context.state();
+        let table = crate::table::Table::load(&state, table_url.clone()).await?;
+        table
+            .metadata()
+            .current_snapshot()
+            .map(Snapshot::snapshot_id)
+            .ok_or_else(|| DataFusionError::Plan("table must have a current snapshot".to_string()))
+    }
+
+    async fn live_data_file_paths(
+        context: &SessionContext,
+        table_url: &Url,
+    ) -> Result<Vec<String>> {
+        let state = context.state();
+        let table = crate::table::Table::load(&state, table_url.clone()).await?;
+        let snapshot = table.metadata().current_snapshot().ok_or_else(|| {
+            DataFusionError::Plan("table must have a current snapshot".to_string())
+        })?;
+        let object_store = state
+            .runtime_env()
+            .object_store_registry
+            .get_store(table_url)
+            .map_err(|error| DataFusionError::External(Box::new(error)))?;
+        let store_ctx = StoreContext::new(object_store, table_url)?;
+        let manifest_list = load_manifest_list(&store_ctx, snapshot.manifest_list()).await?;
+        let mut paths = vec![];
+        for manifest_file in manifest_list
+            .entries()
+            .iter()
+            .filter(|manifest| matches!(manifest.content, ManifestContentType::Data))
+        {
+            let manifest = load_manifest(&store_ctx, &manifest_file.manifest_path).await?;
+            paths.extend(
+                manifest
+                    .entries()
+                    .iter()
+                    .filter(|entry| {
+                        matches!(
+                            entry.status,
+                            ManifestStatus::Added | ManifestStatus::Existing
+                        )
+                    })
+                    .map(|entry| entry.data_file.file_path.clone()),
+            );
+        }
+        paths.sort();
+        Ok(paths)
+    }
+
+    #[test]
+    fn dynamic_partition_overwrite_removes_only_touched_live_partitions() -> Result<()> {
+        let added = vec![partitioned_data_file("data/new-a.parquet", 3, 10)];
+        let live = vec![
+            partitioned_data_file("data/old-a.parquet", 3, 10),
+            partitioned_data_file("data/old-b.parquet", 3, 20),
+        ];
+
+        let removed =
+            IcebergCommitExec::dynamic_partition_overwrite_paths(&added, &live, &partition_spec())?;
+
+        assert_eq!(removed, vec!["data/old-a.parquet"]);
+        Ok(())
+    }
+
+    #[test]
+    fn dynamic_partition_overwrite_rejects_live_partition_spec_evolution() {
+        let added = vec![partitioned_data_file("data/new.parquet", 3, 10)];
+        let live = vec![partitioned_data_file("data/old.parquet", 2, 10)];
+
+        let error =
+            IcebergCommitExec::dynamic_partition_overwrite_paths(&added, &live, &partition_spec())
+                .expect_err("historical live partition specs must fail closed");
+
+        assert!(
+            error
+                .to_string()
+                .contains("incomparable live partition specs")
+        );
+    }
+
+    #[test]
+    fn dynamic_partition_overwrite_rejects_new_files_from_wrong_spec() {
+        let added = vec![partitioned_data_file("data/new.parquet", 2, 10)];
+
+        let error =
+            IcebergCommitExec::dynamic_partition_overwrite_paths(&added, &[], &partition_spec())
+                .expect_err("new files must use the default partition spec");
+
+        assert!(
+            error
+                .to_string()
+                .contains("default Iceberg partition spec 3")
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_partition_overwrite_rejects_active_delete_files() -> Result<()> {
+        let table_url = Url::parse("memory://dynamic-overwrite-delete-files/table/")
+            .map_err(|error| DataFusionError::Plan(error.to_string()))?;
+        let object_store = Arc::new(InMemory::new());
+        let store_ctx = StoreContext::new(object_store, &table_url)?;
+        let schema = partitioned_schema();
+        let spec = partition_spec();
+        let manifest_metadata = ManifestMetadata::new(
+            Arc::new(schema),
+            1,
+            spec.clone(),
+            FormatVersion::V2,
+            ManifestContentType::Deletes,
+        );
+        let mut delete_file = partitioned_data_file("data/delete.parquet", 3, 10);
+        delete_file.content = DataContentType::PositionDeletes;
+        delete_file.referenced_data_file = Some("data/old-a.parquet".to_string());
+        let mut writer = ManifestWriterBuilder::new(Some(7), None, manifest_metadata).build();
+        writer.add(delete_file);
+        let manifest_bytes = writer
+            .to_avro_bytes_v2()
+            .map_err(DataFusionError::Execution)?;
+        let mut manifest_file =
+            writer.into_manifest_file("metadata/delete-manifest.avro".to_string(), 1, 7);
+        manifest_file.manifest_length = i64::try_from(manifest_bytes.len())
+            .map_err(|error| DataFusionError::External(Box::new(error)))?;
+        store_ctx
+            .prefixed
+            .put(
+                &object_store::path::Path::from("metadata/delete-manifest.avro"),
+                object_store::PutPayload::from(Bytes::from(manifest_bytes)),
+            )
+            .await
+            .map_err(|error| DataFusionError::External(Box::new(error)))?;
+        let mut list_writer = ManifestListWriter::new();
+        list_writer.append(manifest_file);
+        let list_bytes = list_writer
+            .to_bytes(FormatVersion::V2)
+            .map_err(DataFusionError::Execution)?;
+        store_ctx
+            .prefixed
+            .put(
+                &object_store::path::Path::from("metadata/snap-delete.avro"),
+                object_store::PutPayload::from(Bytes::from(list_bytes)),
+            )
+            .await
+            .map_err(|error| DataFusionError::External(Box::new(error)))?;
+        let snapshot = SnapshotBuilder::new()
+            .with_snapshot_id(7)
+            .with_sequence_number(1)
+            .with_manifest_list("metadata/snap-delete.avro")
+            .with_summary(crate::spec::snapshots::Summary::new(Operation::Delete))
+            .with_schema_id(1)
+            .build()
+            .map_err(DataFusionError::Execution)?;
+        let mut metadata = table_metadata_at_snapshot(Some(7));
+        metadata.snapshots = vec![snapshot];
+        metadata.partition_specs = vec![spec];
+        metadata.default_spec_id = 3;
+
+        let error = IcebergCommitExec::current_live_data_files(&store_ctx, &metadata)
+            .await
+            .expect_err("active delete files must fail closed");
+
+        assert!(error.to_string().contains("active delete files"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dynamic_partition_overwrite_replaces_only_touched_partition() -> Result<()> {
+        let table_url = Url::parse("memory://dynamic-overwrite-commit/table/")
+            .map_err(|error| DataFusionError::Plan(error.to_string()))?;
+        let object_store = Arc::new(InMemory::new());
+        let context = SessionContext::new();
+        context.runtime_env().register_object_store(
+            &Url::parse("memory://dynamic-overwrite-commit")
+                .map_err(|error| DataFusionError::Plan(error.to_string()))?,
+            object_store,
+        );
+        let schema = partitioned_schema();
+        let spec = partition_spec();
+        let initial: Arc<dyn ExecutionPlan> = Arc::new(IcebergCommitExec::new(
+            commit_input(
+                &table_url,
+                vec![
+                    partitioned_data_file("data/old-a.parquet", 3, 10),
+                    partitioned_data_file("data/old-b.parquet", 3, 20),
+                ],
+                Operation::Append,
+                false,
+                Some(schema),
+                Some(spec),
+            )?,
+            table_url.clone(),
+            None,
+        ));
+        datafusion::physical_plan::collect(initial, context.task_ctx()).await?;
+        let planned_snapshot_id = current_snapshot_id(&context, &table_url).await?;
+
+        let overwrite: Arc<dyn ExecutionPlan> = Arc::new(
+            IcebergCommitExec::new(
+                commit_input(
+                    &table_url,
+                    vec![partitioned_data_file("data/new-a.parquet", 3, 10)],
+                    Operation::Overwrite,
+                    true,
+                    None,
+                    None,
+                )?,
+                table_url.clone(),
+                None,
+            )
+            .with_expected_snapshot_id(Some(Some(planned_snapshot_id)))
+            .with_rewrite_data_files(vec![], Operation::Overwrite),
+        );
+        datafusion::physical_plan::collect(overwrite, context.task_ctx()).await?;
+
+        assert_eq!(
+            live_data_file_paths(&context, &table_url).await?,
+            vec![
+                "data/new-a.parquet".to_string(),
+                "data/old-b.parquet".to_string(),
+            ]
+        );
+        Ok(())
     }
 
     #[test]
@@ -1312,6 +1752,25 @@ mod tests {
             lakehouse_table: None,
             schema: None,
             partition_spec: None,
+            dynamic_partition_overwrite: false,
+        })?;
+        let schema = iceberg_action_schema()?;
+        let input: Arc<dyn ExecutionPlan> =
+            MemorySourceConfig::try_new_from_batches(schema, vec![batch])?;
+        Ok(input)
+    }
+
+    fn validation_only_dynamic_overwrite_input(table_url: &Url) -> Result<Arc<dyn ExecutionPlan>> {
+        let batch = encode_commit_meta(CommitMeta {
+            table_uri: table_url.to_string(),
+            row_count: 0,
+            operation: Operation::Overwrite,
+            requirements: vec![],
+            table_properties: vec![],
+            lakehouse_table: None,
+            schema: None,
+            partition_spec: None,
+            dynamic_partition_overwrite: true,
         })?;
         let schema = iceberg_action_schema()?;
         let input: Arc<dyn ExecutionPlan> =
@@ -1390,6 +1849,57 @@ mod tests {
         );
         let batches = datafusion::physical_plan::collect(current, context.task_ctx()).await?;
         assert_eq!(batches.len(), 1);
+        let counts = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| DataFusionError::Internal("count must be UInt64".to_string()))?;
+        assert_eq!(counts.value(0), 0);
+
+        let metadata_objects = store_ctx
+            .prefixed
+            .list(Some(&object_store::path::Path::from("metadata")))
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|error| DataFusionError::External(Box::new(error)))?;
+        assert_eq!(metadata_objects.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn empty_dynamic_partition_overwrite_is_a_validated_noop() -> Result<()> {
+        let table_url = Url::parse("memory://empty-dynamic-overwrite/table")
+            .map_err(|error| DataFusionError::Plan(error.to_string()))?;
+        let object_store = Arc::new(InMemory::new());
+        let store_ctx = StoreContext::new(object_store.clone(), &table_url)?;
+        let metadata = table_metadata_at_snapshot(Some(2))
+            .to_json()
+            .map_err(|error| DataFusionError::External(Box::new(error)))?;
+        store_ctx
+            .prefixed
+            .put(
+                &object_store::path::Path::from("metadata/v1.metadata.json"),
+                object_store::PutPayload::from(Bytes::from(metadata)),
+            )
+            .await
+            .map_err(|error| DataFusionError::External(Box::new(error)))?;
+        let context = SessionContext::new();
+        context.runtime_env().register_object_store(
+            &Url::parse("memory://empty-dynamic-overwrite")
+                .map_err(|error| DataFusionError::Plan(error.to_string()))?,
+            object_store,
+        );
+        let commit: Arc<dyn ExecutionPlan> = Arc::new(
+            IcebergCommitExec::new(
+                validation_only_dynamic_overwrite_input(&table_url)?,
+                table_url,
+                None,
+            )
+            .with_expected_snapshot_id(Some(Some(2)))
+            .with_rewrite_data_files(vec![], Operation::Overwrite),
+        );
+
+        let batches = datafusion::physical_plan::collect(commit, context.task_ctx()).await?;
         let counts = batches[0]
             .column(0)
             .as_any()
