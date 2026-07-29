@@ -593,12 +593,13 @@ def test_python_declared_failure_kind_is_structured_and_message_free(
 ):
     """A declared failure crosses Spark Connect by finite class, not Python text."""
     import pyarrow as pa
-    import pysail.spark
     from pyspark import errors
     from pyspark.sql import SparkSession
     from pyspark.sql.datasource import DataSource, DataSourceReader, InputPartition
 
-    class DeclaredDataSourceFailure(Exception):
+    import pysail.spark
+
+    class DeclaredDataSourceError(Exception):
         __sail_data_source_failure_kind__ = failure_kind
 
         def __getattribute__(self, name: str):
@@ -606,11 +607,13 @@ def test_python_declared_failure_kind_is_structured_and_message_free(
                 return "masked-on-instance"
             return super().__getattribute__(name)
 
+    private_detail = "detail that must not cross the boundary"
+
     def direct_read(_reader, _partition):
-        raise DeclaredDataSourceFailure("detail that must not cross the boundary")
+        raise DeclaredDataSourceError(private_detail)
 
     def generator_read(_reader, _partition):
-        raise DeclaredDataSourceFailure("detail that must not cross the boundary")
+        raise DeclaredDataSourceError(private_detail)
         yield (0,)  # pragma: no cover - makes this a generator like streaming readers
 
     class DeclaredFailureReader(DataSourceReader):
@@ -643,9 +646,9 @@ def test_python_declared_failure_kind_is_structured_and_message_free(
         with pytest.raises(exception_type) as caught:
             frame.collect()
         assert expected_message in str(caught.value)
-        assert "detail that must not cross the boundary" not in str(caught.value)
+        assert private_detail not in str(caught.value)
         assert caught.value.__cause__ is None
-        assert "detail that must not cross the boundary" not in repr(caught.value.__context__)
+        assert private_detail not in repr(caught.value.__context__)
     finally:
         with contextlib.suppress(Exception):
             spark.stop()

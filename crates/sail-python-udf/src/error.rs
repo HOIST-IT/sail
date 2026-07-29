@@ -69,8 +69,9 @@ impl PythonErrorCauseExtractor for PyErrExtractor {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use pyo3::exceptions::PyRuntimeError;
+
+    use super::*;
 
     #[test]
     #[expect(clippy::unwrap_used)]
