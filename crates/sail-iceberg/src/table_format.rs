@@ -389,6 +389,20 @@ impl UserDefinedLogicalNodeCore for IcebergWriteNode {
     }
 }
 
+fn physical_iceberg_sink_mode(mode: SinkMode) -> PhysicalSinkMode {
+    match mode {
+        SinkMode::ErrorIfExists => PhysicalSinkMode::ErrorIfExists,
+        SinkMode::IgnoreIfExists => PhysicalSinkMode::IgnoreIfExists,
+        SinkMode::Append => PhysicalSinkMode::Append,
+        SinkMode::Overwrite => PhysicalSinkMode::Overwrite,
+        SinkMode::OverwriteIf { condition } => PhysicalSinkMode::OverwriteIf {
+            source: condition.source.clone(),
+            condition: Some(condition),
+        },
+        SinkMode::OverwritePartitions => PhysicalSinkMode::OverwritePartitions,
+    }
+}
+
 pub(crate) async fn plan_iceberg_write(
     ctx: &SessionState,
     logical_input: &LogicalPlan,
@@ -407,15 +421,7 @@ pub(crate) async fn plan_iceberg_write(
         lakehouse_table,
     } = node.options().clone();
 
-    let mode = match mode {
-        SinkMode::ErrorIfExists => PhysicalSinkMode::ErrorIfExists,
-        SinkMode::IgnoreIfExists => PhysicalSinkMode::IgnoreIfExists,
-        SinkMode::Append => PhysicalSinkMode::Append,
-        SinkMode::Overwrite => PhysicalSinkMode::Overwrite,
-        SinkMode::OverwriteIf { .. } | SinkMode::OverwritePartitions => {
-            return not_impl_err!("predicate or partition overwrite for Iceberg");
-        }
-    };
+    let mode = physical_iceberg_sink_mode(mode);
     validate_iceberg_lakehouse_storage_access(lakehouse_table.as_ref())?;
     let metadata_location = metadata_location_from_options(&options);
     let catalog_managed_table = catalog_managed_iceberg_from_options(&options);
@@ -450,33 +456,34 @@ pub(crate) async fn plan_iceberg_write(
     };
     let table_exists = exists_res.is_ok();
 
-    match mode {
+    match &mode {
         PhysicalSinkMode::ErrorIfExists if table_exists => {
             return plan_err!("Iceberg table already exists at path: {table_url}");
         }
         PhysicalSinkMode::IgnoreIfExists if table_exists => {
             return Ok(Arc::new(EmptyExec::new(physical_input.schema())));
         }
-        PhysicalSinkMode::OverwriteIf { .. } | PhysicalSinkMode::OverwritePartitions => {
-            return not_impl_err!("predicate or partition overwrite for Iceberg");
-        }
         _ => {}
     }
 
-    let existing_partition_columns = if table_exists {
-        let metadata_location = catalog_managed_table.then_some(metadata_location).flatten();
-        let table =
-            Table::load_with_metadata_location(ctx, table_url.clone(), metadata_location).await?;
-        Some(IcebergTableFormat::partition_columns_from_metadata(&table)?)
+    let existing_table = if table_exists {
+        let metadata_location = catalog_managed_table
+            .then_some(metadata_location.clone())
+            .flatten();
+        Some(Table::load_with_metadata_location(ctx, table_url.clone(), metadata_location).await?)
     } else {
         None
     };
+    let existing_partition_columns = existing_table
+        .as_ref()
+        .map(IcebergTableFormat::partition_columns_from_metadata)
+        .transpose()?;
 
     if let Some(existing_partitions) = &existing_partition_columns
         && !partition_by.is_empty()
         && partition_by != *existing_partitions
     {
-        match mode {
+        match &mode {
             PhysicalSinkMode::Append => {
                 return plan_err!(
                     "Partition column mismatch. Table is partitioned by {:?}, but write specified {:?}. \
@@ -489,6 +496,14 @@ pub(crate) async fn plan_iceberg_write(
                 return plan_err!(
                     "Partition column mismatch. Table is partitioned by {:?}, but write specified {:?}. \
                         Set overwriteSchema=true to change partitioning.",
+                    format_partition_exprs(existing_partitions),
+                    format_partition_exprs(&partition_by)
+                );
+            }
+            PhysicalSinkMode::OverwriteIf { .. } | PhysicalSinkMode::OverwritePartitions => {
+                return plan_err!(
+                    "Partition column mismatch. Table is partitioned by {:?}, but scoped overwrite specified {:?}. \
+                        Scoped overwrite cannot change Iceberg partitioning.",
                     format_partition_exprs(existing_partitions),
                     format_partition_exprs(&partition_by)
                 );
@@ -507,14 +522,50 @@ pub(crate) async fn plan_iceberg_write(
     options.apply_variant_shredding_option_presence(variant_shredding_option_presence);
     options.table_properties = table_properties;
     options.lakehouse_table = lakehouse_table;
+    let logical_input_schema = Arc::new(logical_input.schema().as_arrow().clone());
+
+    if let (Some(table), PhysicalSinkMode::OverwriteIf { condition, .. }) =
+        (existing_table.as_ref(), mode.clone())
+    {
+        let condition = condition.map(|condition| *condition).ok_or_else(|| {
+            DataFusionError::Internal(
+                "missing driver-side predicate for Iceberg predicate overwrite".to_string(),
+            )
+        })?;
+        let provider = table.to_provider(&IcebergReadOptions {
+            use_ref: None,
+            snapshot_id: None,
+            timestamp_as_of: None,
+            metadata_as_data_read: false,
+        })?;
+        return provider
+            .build_cow_overwrite_if_plan(
+                ctx,
+                physical_input,
+                logical_input_schema,
+                condition,
+                options,
+                physical_sort,
+            )
+            .await;
+    }
+
+    let is_scoped_overwrite = matches!(
+        &mode,
+        PhysicalSinkMode::OverwriteIf { .. } | PhysicalSinkMode::OverwritePartitions
+    );
+    let expected_snapshot_id = existing_table.as_ref().and_then(|table| {
+        table
+            .metadata()
+            .current_snapshot()
+            .map(Snapshot::snapshot_id)
+    });
     let table_config = IcebergTableConfig {
         table_url,
         partition_columns: resolved_partition_columns,
         table_exists,
         options,
     };
-
-    let logical_input_schema = Arc::new(logical_input.schema().as_arrow().clone());
     let builder = IcebergPlanBuilder::new(
         physical_input,
         table_config,
@@ -523,7 +574,15 @@ pub(crate) async fn plan_iceberg_write(
         Some(logical_input_schema),
         ctx,
     );
-    builder.build().await
+    if is_scoped_overwrite {
+        builder
+            .with_expected_snapshot_id(Some(expected_snapshot_id))
+            .with_rewrite_data_files(vec![], crate::spec::Operation::Overwrite)
+            .build()
+            .await
+    } else {
+        builder.build().await
+    }
 }
 
 impl IcebergTableFormat {
@@ -1087,6 +1146,82 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn scoped_sink_modes_are_preserved_for_physical_planning() -> Result<()> {
+        let condition = sail_common_datafusion::logical_expr::ExprWithSource::new(
+            datafusion_expr::col("id").eq(datafusion_expr::lit(7_i64)),
+            Some("id = 7".to_string()),
+        );
+        let overwrite_if = physical_iceberg_sink_mode(SinkMode::OverwriteIf {
+            condition: Box::new(condition.clone()),
+        });
+        match overwrite_if {
+            PhysicalSinkMode::OverwriteIf {
+                condition: Some(actual),
+                source,
+            } => {
+                assert_eq!(*actual, condition);
+                assert_eq!(source.as_deref(), Some("id = 7"));
+            }
+            other => {
+                return Err(DataFusionError::Internal(format!(
+                    "expected overwrite-if mode, got {other:?}"
+                )));
+            }
+        }
+        assert_eq!(
+            physical_iceberg_sink_mode(SinkMode::OverwritePartitions),
+            PhysicalSinkMode::OverwritePartitions
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn plan_new_overwrite_partitions_binds_empty_snapshot() -> Result<()> {
+        use datafusion::execution::context::SessionContext;
+        use datafusion::logical_expr::LogicalPlanBuilder;
+        use object_store::memory::InMemory;
+
+        let context = SessionContext::new();
+        context.runtime_env().register_object_store(
+            &Url::parse("memory://scoped-overwrite-plan")
+                .map_err(|error| DataFusionError::Plan(error.to_string()))?,
+            Arc::new(InMemory::new()),
+        );
+        let state = context.state();
+        let logical_input =
+            LogicalPlanBuilder::values(vec![vec![datafusion_expr::lit(1_i64)]])?.build()?;
+        let physical_input = state.create_physical_plan(&logical_input).await?;
+        let node = IcebergWriteNode::new(
+            Arc::new(logical_input.clone()),
+            IcebergWriteNodeOptions {
+                path: "memory://scoped-overwrite-plan/table".to_string(),
+                mode: SinkMode::OverwritePartitions,
+                partition_by: vec![],
+                bucket_by: None,
+                sort_order: vec![],
+                options: vec![],
+                lakehouse_table: None,
+            },
+        );
+
+        let plan = plan_iceberg_write(&state, &logical_input, physical_input, &node).await?;
+        let commit = plan
+            .downcast_ref::<crate::physical_plan::commit::commit_exec::IcebergCommitExec>()
+            .ok_or_else(|| {
+                DataFusionError::Internal(
+                    "scoped overwrite plan root must be IcebergCommitExec".to_string(),
+                )
+            })?;
+
+        assert_eq!(commit.expected_snapshot_id(), Some(None));
+        assert_eq!(
+            commit.operation_override(),
+            Some(&crate::spec::Operation::Overwrite)
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn create_deleter_builds_conditionless_iceberg_row_level_node() -> Result<()> {

@@ -366,12 +366,9 @@ impl ExecutionPlan for IcebergWriterExec {
                     }
                 }
                 PhysicalSinkMode::Append => {}
-                PhysicalSinkMode::Overwrite => {}
-                PhysicalSinkMode::OverwriteIf { .. } | PhysicalSinkMode::OverwritePartitions => {
-                    return Err(DataFusionError::NotImplemented(
-                        "predicate or partition overwrite not implemented for Iceberg".to_string(),
-                    ));
-                }
+                PhysicalSinkMode::Overwrite
+                | PhysicalSinkMode::OverwriteIf { .. }
+                | PhysicalSinkMode::OverwritePartitions => {}
             }
 
             let table_object_store = get_object_store_from_context(&context, &table_url)?;
@@ -603,7 +600,12 @@ impl ExecutionPlan for IcebergWriterExec {
             let commit_meta = CommitMeta {
                 table_uri: table_url.to_string(),
                 row_count: total_rows,
-                operation: if matches!(sink_mode, PhysicalSinkMode::Overwrite) {
+                operation: if matches!(
+                    sink_mode,
+                    PhysicalSinkMode::Overwrite
+                        | PhysicalSinkMode::OverwriteIf { .. }
+                        | PhysicalSinkMode::OverwritePartitions
+                ) {
                     crate::spec::Operation::Overwrite
                 } else {
                     crate::spec::Operation::Append
@@ -619,6 +621,10 @@ impl ExecutionPlan for IcebergWriterExec {
                 } else {
                     None
                 },
+                dynamic_partition_overwrite: matches!(
+                    sink_mode,
+                    PhysicalSinkMode::OverwritePartitions
+                ),
             };
 
             let schema = iceberg_action_schema()?;
@@ -650,5 +656,59 @@ impl DisplayAs for IcebergWriterExec {
                 write!(f, "table_path={}", self.table_url)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use datafusion::arrow::array::Int64Array;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::prelude::SessionContext;
+    use object_store::memory::InMemory;
+
+    use super::*;
+    use crate::physical_plan::action_schema::decode_actions_and_meta_from_batch;
+
+    #[tokio::test]
+    async fn overwrite_partitions_emits_dynamic_overwrite_commit_meta() -> Result<()> {
+        let input_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let input_batch = RecordBatch::try_new(
+            input_schema.clone(),
+            vec![Arc::new(Int64Array::from(Vec::<i64>::new()))],
+        )?;
+        let input: Arc<dyn ExecutionPlan> =
+            MemorySourceConfig::try_new_from_batches(input_schema.clone(), vec![input_batch])?;
+        let table_url = Url::parse("memory://scoped-writer/table")
+            .map_err(|error| DataFusionError::Plan(error.to_string()))?;
+        let context = SessionContext::new();
+        context.runtime_env().register_object_store(
+            &Url::parse("memory://scoped-writer")
+                .map_err(|error| DataFusionError::Plan(error.to_string()))?,
+            Arc::new(InMemory::new()),
+        );
+        let writer: Arc<dyn ExecutionPlan> = Arc::new(IcebergWriterExec::new(
+            input,
+            table_url,
+            vec![],
+            PhysicalSinkMode::OverwritePartitions,
+            false,
+            IcebergWriterExecOptions::default(),
+            Some(input_schema),
+        ));
+
+        let batches = datafusion::physical_plan::collect(writer, context.task_ctx()).await?;
+        let commit_meta = batches
+            .iter()
+            .map(decode_actions_and_meta_from_batch)
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .find_map(|(_, _, meta)| meta)
+            .ok_or_else(|| DataFusionError::Internal("missing writer commit meta".to_string()))?;
+
+        assert_eq!(commit_meta.operation, crate::spec::Operation::Overwrite);
+        assert!(commit_meta.dynamic_partition_overwrite);
+        Ok(())
     }
 }

@@ -41,6 +41,8 @@ pub struct CommitMeta {
     pub lakehouse_table: Option<LakehouseExecutionContext>,
     pub schema: Option<IcebergSchema>,
     pub partition_spec: Option<PartitionSpec>,
+    /// Whether the commit must replace every live file in touched output partitions.
+    pub dynamic_partition_overwrite: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,6 +59,8 @@ pub struct CommitMetaAction {
     pub schema_json: Option<String>,
     /// Optional PartitionSpec JSON (rare) to avoid huge Arrow schema.
     pub partition_spec_json: Option<String>,
+    #[serde(default)]
+    pub dynamic_partition_overwrite: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -533,6 +537,7 @@ pub fn encode_commit_meta(meta: CommitMeta) -> Result<RecordBatch> {
             lakehouse_table_json,
             schema_json,
             partition_spec_json,
+            dynamic_partition_overwrite: meta.dynamic_partition_overwrite,
         }),
     }];
     encode_actions(rows)
@@ -591,6 +596,7 @@ pub fn decode_actions_and_meta_from_batch(
                     lakehouse_table,
                     schema,
                     partition_spec,
+                    dynamic_partition_overwrite: m.dynamic_partition_overwrite,
                 });
             }
         }
@@ -673,6 +679,7 @@ mod tests {
             lakehouse_table: None,
             schema: None,
             partition_spec: None,
+            dynamic_partition_overwrite: true,
         };
 
         let schema = iceberg_action_schema()?;
@@ -690,7 +697,10 @@ mod tests {
         assert_eq!(adds[0].nan_value_counts, df.nan_value_counts);
         assert_eq!(adds[0].lower_bounds, df.lower_bounds);
         assert_eq!(adds[0].upper_bounds, df.upper_bounds);
-        assert!(meta.is_some());
+        assert_eq!(
+            meta.as_ref().map(|meta| meta.dynamic_partition_overwrite),
+            Some(true)
+        );
         Ok(())
     }
 }

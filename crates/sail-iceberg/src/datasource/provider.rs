@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::arrow::datatypes::Schema as ArrowSchema;
+use datafusion::arrow::datatypes::{Schema as ArrowSchema, SchemaRef};
 use datafusion::catalog::Session;
 use datafusion::catalog::memory::DataSourceExec;
 use datafusion::common::scalar::ScalarValue;
@@ -545,6 +545,18 @@ impl IcebergTableProvider {
         }
     }
 
+    fn arrow_field_ids(&self) -> Vec<Option<i32>> {
+        self.arrow_schema
+            .fields()
+            .iter()
+            .map(|field| {
+                self.schema
+                    .field_by_name(field.name())
+                    .map(|field| field.id)
+            })
+            .collect()
+    }
+
     /// Aggregate table-level statistics from a list of Iceberg data files
     fn aggregate_statistics(&self, data_files: &[DataFile]) -> Statistics {
         if data_files.is_empty() {
@@ -554,8 +566,8 @@ impl IcebergTableProvider {
         let mut total_rows: usize = 0;
         let mut total_bytes: usize = 0;
 
-        // Pre-compute field id per column index
-        let field_ids: Vec<i32> = self.schema.fields().iter().map(|f| f.id).collect();
+        // Preserve the Arrow output order, which may move identity partition columns.
+        let field_ids = self.arrow_field_ids();
 
         // Initialize accumulators per column
         let mut min_scalars: Vec<Option<ScalarValue>> =
@@ -569,6 +581,10 @@ impl IcebergTableProvider {
             total_bytes = total_bytes.saturating_add(df.file_size_in_bytes() as usize);
 
             for (col_idx, field_id) in field_ids.iter().enumerate() {
+                let Some(field_id) = field_id else {
+                    continue;
+                };
+
                 // null counts
                 if let Some(c) = df.null_value_counts().get(field_id) {
                     null_counts[col_idx] = null_counts[col_idx].saturating_add(*c as usize);
@@ -636,33 +652,27 @@ impl IcebergTableProvider {
             .arrow_schema
             .fields()
             .iter()
-            .enumerate()
-            .map(|(i, _field)| {
+            .map(|field| {
                 let field_id = self
                     .schema
-                    .fields()
-                    .get(i)
-                    .map(|f| f.id)
-                    .unwrap_or(i as i32 + 1);
+                    .field_by_name(field.name())
+                    .map(|field| field.id);
 
-                let null_count = data_file
-                    .null_value_counts()
-                    .get(&field_id)
+                let null_count = field_id
+                    .and_then(|field_id| data_file.null_value_counts().get(&field_id))
                     .map(|&count| Precision::Exact(count as usize))
                     .unwrap_or(Precision::Absent);
 
                 let distinct_count = Precision::Absent;
 
-                let min_value = data_file
-                    .lower_bounds()
-                    .get(&field_id)
+                let min_value = field_id
+                    .and_then(|field_id| data_file.lower_bounds().get(&field_id))
                     .map(|datum| primitive_to_scalar_default(&datum.literal))
                     .map(Precision::Exact)
                     .unwrap_or(Precision::Absent);
 
-                let max_value = data_file
-                    .upper_bounds()
-                    .get(&field_id)
+                let max_value = field_id
+                    .and_then(|field_id| data_file.upper_bounds().get(&field_id))
                     .map(|datum| primitive_to_scalar_default(&datum.literal))
                     .map(Precision::Exact)
                     .unwrap_or(Precision::Absent);
@@ -745,6 +755,130 @@ impl IcebergTableProvider {
         let survivor_expr = Expr::IsNotTrue(Box::new(condition.expr));
         let physical_expr = session.create_physical_expr(survivor_expr, &schema)?;
         Ok(Arc::new(FilterExec::try_new(physical_expr, input)?))
+    }
+
+    fn align_schemas_for_union(
+        new_data: Arc<dyn ExecutionPlan>,
+        old_data: Arc<dyn ExecutionPlan>,
+    ) -> Result<(Arc<dyn ExecutionPlan>, Arc<dyn ExecutionPlan>)> {
+        let new_schema = new_data.schema();
+        let old_schema = old_data.schema();
+        if new_schema.fields().len() != old_schema.fields().len() {
+            return plan_err!(
+                "schema mismatch between new and existing Iceberg data during predicate overwrite"
+            );
+        }
+
+        let mut new_projection = Vec::with_capacity(new_schema.fields().len());
+        let mut old_projection = Vec::with_capacity(new_schema.fields().len());
+        for (new_index, new_field) in new_schema.fields().iter().enumerate() {
+            let (old_index, old_field) = old_schema
+                .fields()
+                .iter()
+                .enumerate()
+                .find(|(_, field)| field.name() == new_field.name())
+                .ok_or_else(|| {
+                    datafusion::common::DataFusionError::Plan(format!(
+                        "field '{}' is missing from existing Iceberg data during predicate overwrite",
+                        new_field.name()
+                    ))
+                })?;
+            if old_field.data_type() != new_field.data_type() {
+                return plan_err!(
+                    "field '{}' has incompatible types during predicate overwrite: new={}, existing={}",
+                    new_field.name(),
+                    new_field.data_type(),
+                    old_field.data_type()
+                );
+            }
+            new_projection.push((
+                Arc::new(Column::new(new_field.name(), new_index)) as Arc<dyn PhysicalExpr>,
+                new_field.name().clone(),
+            ));
+            old_projection.push((
+                Arc::new(Column::new(new_field.name(), old_index)) as Arc<dyn PhysicalExpr>,
+                new_field.name().clone(),
+            ));
+        }
+
+        Ok((
+            Arc::new(ProjectionExec::try_new(new_projection, new_data)?),
+            Arc::new(ProjectionExec::try_new(old_projection, old_data)?),
+        ))
+    }
+
+    pub(crate) async fn build_cow_overwrite_if_plan(
+        &self,
+        session: &dyn Session,
+        new_data: Arc<dyn ExecutionPlan>,
+        prepared_logical_input_schema: SchemaRef,
+        condition: ExprWithSource,
+        writer_options: IcebergWriterExecOptions,
+        sort_order: Option<Vec<datafusion::physical_expr::PhysicalSortExpr>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let table_url = Url::parse(&self.table_uri)
+            .map_err(|error| datafusion::common::DataFusionError::External(Box::new(error)))?;
+        let expected_snapshot_id = Some(self.snapshot.as_ref().map(Snapshot::snapshot_id));
+        let source = condition.source.clone();
+        let logical_input_schema = Some(prepared_logical_input_schema);
+        let (candidate_scan, removed_data_file_paths) = if self.snapshot.is_some() {
+            let object_store = get_object_store_from_session(session, &table_url)?;
+            let store_ctx = StoreContext::new(object_store, &table_url)?;
+            let manifest_list = self.load_manifest_list(&store_ctx).await?;
+            let delete_index = self
+                .build_delete_file_index(&store_ctx, &manifest_list)
+                .await?;
+            if !delete_index.is_empty() {
+                return plan_err!(
+                    "copy-on-write predicate overwrite is not supported for Iceberg tables with active delete files"
+                );
+            }
+            let filters = vec![condition.expr.clone()];
+            let candidates = self
+                .load_data_files_with_seq(session, &filters, &store_ctx, &manifest_list)
+                .await?
+                .into_iter()
+                .map(|(data_file, _)| data_file)
+                .collect::<Vec<_>>();
+            let removed_data_file_paths = candidates
+                .iter()
+                .map(|data_file| data_file.file_path.clone())
+                .collect();
+            (
+                self.scan_data_files(session, &store_ctx, candidates)?,
+                removed_data_file_paths,
+            )
+        } else {
+            (
+                Arc::new(EmptyExec::new(self.arrow_schema.clone())) as Arc<dyn ExecutionPlan>,
+                vec![],
+            )
+        };
+        let survivor_plan =
+            Self::retain_delete_survivors(session, candidate_scan, Some(condition))?;
+        let (new_data, survivor_plan) = Self::align_schemas_for_union(new_data, survivor_plan)?;
+        let rewrite_input = UnionExec::try_new(vec![new_data, survivor_plan])?;
+        let table_config = IcebergTableConfig {
+            table_url,
+            partition_columns: self.current_partition_columns()?,
+            table_exists: true,
+            options: writer_options,
+        };
+        IcebergPlanBuilder::new(
+            rewrite_input,
+            table_config,
+            PhysicalSinkMode::OverwriteIf {
+                condition: None,
+                source,
+            },
+            sort_order,
+            logical_input_schema,
+            session,
+        )
+        .with_expected_snapshot_id(expected_snapshot_id)
+        .with_rewrite_data_files(removed_data_file_paths, crate::spec::Operation::Overwrite)
+        .build()
+        .await
     }
 
     pub(crate) async fn build_cow_delete_plan(
@@ -1391,10 +1525,18 @@ mod tests {
     use sail_common_datafusion::logical_expr::ExprWithSource;
 
     use super::*;
+    use crate::physical_plan::IcebergWriterExec;
     use crate::physical_plan::commit::commit_exec::IcebergCommitExec;
     use crate::spec::manifest::{DataContentType, DataFileFormat, ManifestWriterBuilder};
     use crate::spec::types::{NestedField, PrimitiveType, Type};
     use crate::spec::{FormatVersion, ManifestListWriter, SnapshotBuilder};
+
+    fn find_writer(plan: &Arc<dyn ExecutionPlan>) -> Option<&IcebergWriterExec> {
+        if let Some(writer) = plan.downcast_ref::<IcebergWriterExec>() {
+            return Some(writer);
+        }
+        plan.children().into_iter().find_map(find_writer)
+    }
 
     fn test_schema() -> Result<Schema> {
         Schema::builder()
@@ -1418,6 +1560,100 @@ mod tests {
             ))])
             .build()
             .map_err(datafusion::common::DataFusionError::Execution)
+    }
+
+    fn partitioned_statistics_schema() -> Result<Schema> {
+        Schema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                Arc::new(NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Long),
+                )),
+                Arc::new(NestedField::required(
+                    2,
+                    "category",
+                    Type::Primitive(PrimitiveType::String),
+                )),
+                Arc::new(NestedField::required(
+                    3,
+                    "value",
+                    Type::Primitive(PrimitiveType::Long),
+                )),
+            ])
+            .build()
+            .map_err(datafusion::common::DataFusionError::Execution)
+    }
+
+    fn partitioned_statistics_data_file() -> DataFile {
+        use crate::spec::types::values::PrimitiveLiteral;
+
+        let mut data_file = bounded_int_data_file("data/category=C/part.parquet", 7, 7);
+        data_file.partition = vec![Some(Literal::Primitive(PrimitiveLiteral::String(
+            "C".to_string(),
+        )))];
+        data_file.record_count = 1;
+        data_file.value_counts = HashMap::from([(1, 1), (2, 1), (3, 1)]);
+        data_file.null_value_counts = HashMap::from([(1, 0), (2, 0), (3, 0)]);
+        let bounds = HashMap::from([
+            (
+                1,
+                crate::spec::Datum::new(PrimitiveType::Long, PrimitiveLiteral::Long(7)),
+            ),
+            (
+                2,
+                crate::spec::Datum::new(
+                    PrimitiveType::String,
+                    PrimitiveLiteral::String("C".to_string()),
+                ),
+            ),
+            (
+                3,
+                crate::spec::Datum::new(PrimitiveType::Long, PrimitiveLiteral::Long(300)),
+            ),
+        ]);
+        data_file.lower_bounds = bounds.clone();
+        data_file.upper_bounds = bounds;
+        data_file
+    }
+
+    #[test]
+    fn statistics_follow_reordered_arrow_schema() -> Result<()> {
+        let partition_spec = PartitionSpec::builder()
+            .with_spec_id(0)
+            .add_field(2, "category", Transform::Identity)
+            .build();
+        let provider = IcebergTableProvider::new_empty(
+            "file:///tmp/iceberg-reordered-statistics",
+            partitioned_statistics_schema()?,
+            vec![partition_spec],
+            0,
+        )?;
+        let data_file = partitioned_statistics_data_file();
+
+        let names: Vec<&str> = provider
+            .arrow_schema
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect();
+        assert_eq!(names, vec!["id", "value", "category"]);
+
+        for statistics in [
+            provider.create_file_statistics(&data_file),
+            provider.aggregate_statistics(std::slice::from_ref(&data_file)),
+        ] {
+            assert_eq!(
+                statistics.column_statistics[1].min_value,
+                Precision::Exact(ScalarValue::Int64(Some(300)))
+            );
+            assert_eq!(
+                statistics.column_statistics[2].min_value,
+                Precision::Exact(ScalarValue::Utf8(Some("C".to_string())))
+            );
+        }
+        Ok(())
     }
 
     fn bounded_int_data_file(path: &str, lower: i32, upper: i32) -> DataFile {
@@ -1734,6 +1970,68 @@ mod tests {
             Some(&crate::spec::Operation::Delete)
         );
         assert!(commit.removed_data_file_paths().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn empty_table_overwrite_if_plan_preserves_strict_snapshot_validation() -> Result<()> {
+        let provider = IcebergTableProvider::new_empty(
+            "file:///tmp/iceberg-empty-overwrite-if",
+            test_schema()?,
+            vec![PartitionSpec::unpartitioned_spec()],
+            0,
+        )?;
+        let physical_input_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int64,
+            false,
+        )]));
+        let logical_input_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false).with_metadata(HashMap::from([(
+                "iceberg.test.metadata".to_string(),
+                "preserved".to_string(),
+            )])),
+        ]));
+        let input_batch = RecordBatch::try_new(
+            physical_input_schema.clone(),
+            vec![Arc::new(Int64Array::from(Vec::<i64>::new()))],
+        )?;
+        let input: Arc<dyn ExecutionPlan> =
+            MemorySourceConfig::try_new_from_batches(physical_input_schema, vec![input_batch])?;
+        let context = SessionContext::new();
+        let condition = ExprWithSource::new(
+            datafusion_expr::col("id").eq(datafusion_expr::lit(7_i64)),
+            Some("id = 7".to_string()),
+        );
+
+        let plan = provider
+            .build_cow_overwrite_if_plan(
+                &context.state(),
+                input,
+                logical_input_schema.clone(),
+                condition,
+                IcebergWriterExecOptions::default(),
+                None,
+            )
+            .await?;
+        let commit = plan.downcast_ref::<IcebergCommitExec>().ok_or_else(|| {
+            datafusion::common::DataFusionError::Internal(
+                "overwrite-if plan root must be IcebergCommitExec".to_string(),
+            )
+        })?;
+
+        assert_eq!(commit.expected_snapshot_id(), Some(None));
+        assert_eq!(
+            commit.operation_override(),
+            Some(&crate::spec::Operation::Overwrite)
+        );
+        assert!(commit.removed_data_file_paths().is_empty());
+        let writer = find_writer(&plan).ok_or_else(|| {
+            datafusion::common::DataFusionError::Internal(
+                "overwrite-if plan must contain IcebergWriterExec".to_string(),
+            )
+        })?;
+        assert_eq!(writer.logical_input_schema(), Some(&logical_input_schema));
         Ok(())
     }
 
