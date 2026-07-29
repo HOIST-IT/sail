@@ -794,6 +794,7 @@ fn collect_source_range_filters(
 mod tests {
     use datafusion::arrow::array::Array;
     use datafusion::arrow::datatypes::{DataType, Field};
+    use datafusion::common::ScalarValue;
     use datafusion::prelude::SessionContext;
 
     use super::*;
@@ -819,6 +820,18 @@ mod tests {
                 1,
                 "id",
                 Type::Primitive(PrimitiveType::Int),
+            ))])
+            .build()
+            .map_err(datafusion::common::DataFusionError::Execution)
+    }
+
+    fn test_date_schema() -> Result<Schema> {
+        Schema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "event_date",
+                Type::Primitive(PrimitiveType::Date),
             ))])
             .build()
             .map_err(datafusion::common::DataFusionError::Execution)
@@ -920,6 +933,79 @@ mod tests {
         )?;
 
         assert!(kept.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn date_bounds_are_pruned_against_date_literals() -> Result<()> {
+        let date_bound = |value| Datum::new(PrimitiveType::Date, PrimitiveLiteral::Int(value));
+        let date_file = |path, lower, upper| {
+            let mut file = data_file(path, None, None, Some(0));
+            file.lower_bounds = HashMap::from([(1, date_bound(lower))]);
+            file.upper_bounds = HashMap::from([(1, date_bound(upper))]);
+            file
+        };
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "event_date",
+            DataType::Date32,
+            true,
+        )]));
+        let context = SessionContext::new();
+        let iceberg_schema = test_date_schema()?;
+
+        let (kept, _) = prune_files(
+            &context.state(),
+            &[datafusion_expr::col("event_date")
+                .gt_eq(datafusion_expr::lit(ScalarValue::Date32(Some(19_724))))],
+            None,
+            arrow_schema,
+            vec![
+                date_file("data/matching.parquet", 19_723, 19_725),
+                date_file("data/old.parquet", 19_000, 19_100),
+            ],
+            &iceberg_schema,
+        )?;
+
+        assert_eq!(
+            kept.iter()
+                .map(|file| file.file_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["data/matching.parquet"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn promoted_schema_pruning_keeps_files_when_bounds_are_incompatible() -> Result<()> {
+        let mut historical = data_file("data/historical-int.parquet", None, None, Some(0));
+        historical.lower_bounds =
+            HashMap::from([(1, Datum::new(PrimitiveType::Int, PrimitiveLiteral::Int(1)))]);
+        historical.upper_bounds =
+            HashMap::from([(1, Datum::new(PrimitiveType::Int, PrimitiveLiteral::Int(3)))]);
+        let current = data_file("data/current-long.parquet", Some(4), Some(6), Some(0));
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int64,
+            true,
+        )]));
+        let context = SessionContext::new();
+        let iceberg_schema = test_schema()?;
+
+        let (kept, _) = prune_files(
+            &context.state(),
+            &[datafusion_expr::col("id").gt(datafusion_expr::lit(10_i64))],
+            None,
+            arrow_schema,
+            vec![historical, current],
+            &iceberg_schema,
+        )?;
+
+        assert_eq!(
+            kept.iter()
+                .map(|file| file.file_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["data/historical-int.parquet", "data/current-long.parquet"]
+        );
         Ok(())
     }
 

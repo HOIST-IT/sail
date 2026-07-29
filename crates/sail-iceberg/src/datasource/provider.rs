@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::arrow::datatypes::{Schema as ArrowSchema, SchemaRef};
+use datafusion::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema, SchemaRef};
 use datafusion::catalog::Session;
 use datafusion::catalog::memory::DataSourceExec;
 use datafusion::common::scalar::ScalarValue;
@@ -63,11 +63,13 @@ use crate::physical_plan::manifest_scan_exec::IcebergManifestScanExec;
 use crate::physical_plan::plan_builder::{IcebergPlanBuilder, IcebergTableConfig};
 use crate::spec::delete_index::{DeleteFileIndex, DeleteFileRef};
 use crate::spec::transform::Transform;
+use crate::spec::types::Type;
 use crate::spec::types::values::Literal;
 use crate::spec::{
-    DataFile, ManifestContentType, ManifestList, ManifestStatus, PartitionSpec, Schema, Snapshot,
+    DataFile, Datum, ManifestContentType, ManifestList, ManifestStatus, PartitionSpec, Schema,
+    Snapshot,
 };
-use crate::utils::conversions::primitive_to_scalar_default;
+use crate::utils::conversions::{primitive_to_scalar_default, to_scalar};
 use crate::utils::get_object_store_from_session;
 use crate::utils::partition_transform::catalog_partition_field_from_iceberg;
 
@@ -557,6 +559,30 @@ impl IcebergTableProvider {
             .collect()
     }
 
+    fn datum_to_scalar(datum: &Datum, arrow_type: &ArrowDataType) -> Option<ScalarValue> {
+        let iceberg_type = Type::Primitive(datum.r#type.clone());
+        match to_scalar(&Literal::Primitive(datum.literal.clone()), &iceberg_type) {
+            Ok(value) if &value.data_type() == arrow_type => Some(value),
+            Ok(value) => {
+                log::warn!(
+                    "Ignoring Iceberg {:?} statistic with Arrow type {:?}; current field type is {}",
+                    datum.r#type,
+                    value.data_type(),
+                    arrow_type
+                );
+                None
+            }
+            Err(error) => {
+                log::warn!(
+                    "Failed to convert Iceberg {:?} statistic to Arrow: {}",
+                    datum.r#type,
+                    error
+                );
+                None
+            }
+        }
+    }
+
     /// Aggregate table-level statistics from a list of Iceberg data files
     fn aggregate_statistics(&self, data_files: &[DataFile]) -> Statistics {
         if data_files.is_empty() {
@@ -569,12 +595,13 @@ impl IcebergTableProvider {
         // Preserve the Arrow output order, which may move identity partition columns.
         let field_ids = self.arrow_field_ids();
 
-        // Initialize accumulators per column
-        let mut min_scalars: Vec<Option<ScalarValue>> =
-            vec![None; self.arrow_schema.fields().len()];
-        let mut max_scalars: Vec<Option<ScalarValue>> =
-            vec![None; self.arrow_schema.fields().len()];
-        let mut null_counts: Vec<usize> = vec![0; self.arrow_schema.fields().len()];
+        // A table-level statistic is exact only when every file contributes a compatible value.
+        let column_count = self.arrow_schema.fields().len();
+        let mut min_scalars: Vec<Option<ScalarValue>> = vec![None; column_count];
+        let mut max_scalars: Vec<Option<ScalarValue>> = vec![None; column_count];
+        let mut min_complete = vec![true; column_count];
+        let mut max_complete = vec![true; column_count];
+        let mut null_counts: Vec<Option<usize>> = vec![Some(0); column_count];
 
         for df in data_files {
             total_rows = total_rows.saturating_add(df.record_count() as usize);
@@ -582,45 +609,72 @@ impl IcebergTableProvider {
 
             for (col_idx, field_id) in field_ids.iter().enumerate() {
                 let Some(field_id) = field_id else {
+                    min_complete[col_idx] = false;
+                    max_complete[col_idx] = false;
+                    null_counts[col_idx] = None;
                     continue;
                 };
+                let arrow_type = self.arrow_schema.field(col_idx).data_type();
 
-                // null counts
-                if let Some(c) = df.null_value_counts().get(field_id) {
-                    null_counts[col_idx] = null_counts[col_idx].saturating_add(*c as usize);
+                null_counts[col_idx] =
+                    match (null_counts[col_idx], df.null_value_counts().get(field_id)) {
+                        (Some(total), Some(count)) => Some(total.saturating_add(*count as usize)),
+                        _ => None,
+                    };
+
+                if min_complete[col_idx] {
+                    match df
+                        .lower_bounds()
+                        .get(field_id)
+                        .and_then(|datum| Self::datum_to_scalar(datum, arrow_type))
+                    {
+                        Some(value) => {
+                            min_scalars[col_idx] = match (&min_scalars[col_idx], &value) {
+                                (None, value) => Some(value.clone()),
+                                (Some(current), value) => Some(if value < current {
+                                    value.clone()
+                                } else {
+                                    current.clone()
+                                }),
+                            };
+                        }
+                        None => {
+                            min_complete[col_idx] = false;
+                            min_scalars[col_idx] = None;
+                        }
+                    }
                 }
 
-                // min
-                if let Some(d) = df.lower_bounds().get(field_id) {
-                    let sv = primitive_to_scalar_default(&d.literal);
-                    min_scalars[col_idx] = match (&min_scalars[col_idx], &sv) {
-                        (None, s) => Some(s.clone()),
-                        (Some(existing), s) => Some(if s < existing {
-                            s.clone()
-                        } else {
-                            existing.clone()
-                        }),
-                    };
-                }
-
-                // max
-                if let Some(d) = df.upper_bounds().get(field_id) {
-                    let sv = primitive_to_scalar_default(&d.literal);
-                    max_scalars[col_idx] = match (&max_scalars[col_idx], &sv) {
-                        (None, s) => Some(s.clone()),
-                        (Some(existing), s) => Some(if s > existing {
-                            s.clone()
-                        } else {
-                            existing.clone()
-                        }),
-                    };
+                if max_complete[col_idx] {
+                    match df
+                        .upper_bounds()
+                        .get(field_id)
+                        .and_then(|datum| Self::datum_to_scalar(datum, arrow_type))
+                    {
+                        Some(value) => {
+                            max_scalars[col_idx] = match (&max_scalars[col_idx], &value) {
+                                (None, value) => Some(value.clone()),
+                                (Some(current), value) => Some(if value > current {
+                                    value.clone()
+                                } else {
+                                    current.clone()
+                                }),
+                            };
+                        }
+                        None => {
+                            max_complete[col_idx] = false;
+                            max_scalars[col_idx] = None;
+                        }
+                    }
                 }
             }
         }
 
-        let column_statistics = (0..self.arrow_schema.fields().len())
+        let column_statistics = (0..column_count)
             .map(|i| ColumnStatistics {
-                null_count: Precision::Exact(null_counts[i]),
+                null_count: null_counts[i]
+                    .map(Precision::Exact)
+                    .unwrap_or(Precision::Absent),
                 max_value: max_scalars[i]
                     .clone()
                     .map(Precision::Exact)
@@ -667,13 +721,13 @@ impl IcebergTableProvider {
 
                 let min_value = field_id
                     .and_then(|field_id| data_file.lower_bounds().get(&field_id))
-                    .map(|datum| primitive_to_scalar_default(&datum.literal))
+                    .and_then(|datum| Self::datum_to_scalar(datum, field.data_type()))
                     .map(Precision::Exact)
                     .unwrap_or(Precision::Absent);
 
                 let max_value = field_id
                     .and_then(|field_id| data_file.upper_bounds().get(&field_id))
-                    .map(|datum| primitive_to_scalar_default(&datum.literal))
+                    .and_then(|datum| Self::datum_to_scalar(datum, field.data_type()))
                     .map(Precision::Exact)
                     .unwrap_or(Precision::Absent);
 
@@ -1651,6 +1705,111 @@ mod tests {
             assert_eq!(
                 statistics.column_statistics[2].min_value,
                 Precision::Exact(ScalarValue::Utf8(Some("C".to_string())))
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn statistics_drop_bounds_that_do_not_match_current_arrow_type() -> Result<()> {
+        let provider = IcebergTableProvider::new_empty(
+            "file:///tmp/iceberg-promoted-statistics",
+            test_schema()?,
+            vec![PartitionSpec::unpartitioned_spec()],
+            0,
+        )?;
+        let historical = bounded_int_data_file("data/historical-int.parquet", 1, 3);
+        let mut current = bounded_int_data_file("data/current-long.parquet", 0, 0);
+        current.lower_bounds = HashMap::from([(
+            1,
+            crate::spec::Datum::new(
+                PrimitiveType::Long,
+                crate::spec::types::values::PrimitiveLiteral::Long(4),
+            ),
+        )]);
+        current.upper_bounds = HashMap::from([(
+            1,
+            crate::spec::Datum::new(
+                PrimitiveType::Long,
+                crate::spec::types::values::PrimitiveLiteral::Long(6),
+            ),
+        )]);
+
+        let file_statistics = provider.create_file_statistics(&historical);
+        assert_eq!(
+            file_statistics.column_statistics[0].min_value,
+            Precision::Absent
+        );
+        assert_eq!(
+            file_statistics.column_statistics[0].max_value,
+            Precision::Absent
+        );
+        let aggregate = provider.aggregate_statistics(&[historical, current]);
+        assert_eq!(aggregate.column_statistics[0].min_value, Precision::Absent);
+        assert_eq!(aggregate.column_statistics[0].max_value, Precision::Absent);
+        Ok(())
+    }
+
+    #[test]
+    fn aggregate_statistics_are_absent_when_any_file_metric_is_missing() -> Result<()> {
+        let provider = IcebergTableProvider::new_empty(
+            "file:///tmp/iceberg-incomplete-statistics",
+            test_int_schema()?,
+            vec![PartitionSpec::unpartitioned_spec()],
+            0,
+        )?;
+        let known = bounded_int_data_file("data/known.parquet", 1, 3);
+        let mut unknown = bounded_int_data_file("data/unknown.parquet", 4, 6);
+        unknown.lower_bounds.clear();
+        unknown.upper_bounds.clear();
+        unknown.null_value_counts.clear();
+
+        let aggregate = provider.aggregate_statistics(&[known, unknown]);
+
+        assert_eq!(aggregate.column_statistics[0].min_value, Precision::Absent);
+        assert_eq!(aggregate.column_statistics[0].max_value, Precision::Absent);
+        assert_eq!(aggregate.column_statistics[0].null_count, Precision::Absent);
+        Ok(())
+    }
+
+    #[test]
+    fn aggregate_statistics_preserve_date_scalar_type() -> Result<()> {
+        let schema = Schema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "event_date",
+                Type::Primitive(PrimitiveType::Date),
+            ))])
+            .build()
+            .map_err(datafusion::common::DataFusionError::Execution)?;
+        let provider = IcebergTableProvider::new_empty(
+            "file:///tmp/iceberg-date-statistics",
+            schema,
+            vec![PartitionSpec::unpartitioned_spec()],
+            0,
+        )?;
+        let date_bound = |value| {
+            crate::spec::Datum::new(
+                PrimitiveType::Date,
+                crate::spec::types::values::PrimitiveLiteral::Int(value),
+            )
+        };
+        let mut data_file = bounded_int_data_file("data/date.parquet", 0, 0);
+        data_file.lower_bounds = HashMap::from([(1, date_bound(19_723))]);
+        data_file.upper_bounds = HashMap::from([(1, date_bound(19_725))]);
+
+        for statistics in [
+            provider.create_file_statistics(&data_file),
+            provider.aggregate_statistics(&[data_file]),
+        ] {
+            assert_eq!(
+                statistics.column_statistics[0].min_value,
+                Precision::Exact(ScalarValue::Date32(Some(19_723)))
+            );
+            assert_eq!(
+                statistics.column_statistics[0].max_value,
+                Precision::Exact(ScalarValue::Date32(Some(19_725)))
             );
         }
         Ok(())
