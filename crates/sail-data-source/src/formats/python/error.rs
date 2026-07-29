@@ -3,7 +3,42 @@
 //! Provides structured error types with context for debugging Python datasource issues.
 
 use datafusion_common::DataFusionError;
+use sail_common_datafusion::error::PythonDataSourceFailure;
 use thiserror::Error;
+
+const FAILURE_KIND_ATTRIBUTE: &str = "__sail_data_source_failure_kind__";
+
+fn declared_failure_kind(error: &pyo3::PyErr) -> Option<PythonDataSourceFailure> {
+    use pyo3::prelude::PyAnyMethods;
+    use pyo3::types::{PyTuple, PyTupleMethods, PyType};
+
+    pyo3::Python::attach(|py| {
+        let type_type = py.get_type::<PyType>();
+        let getattribute = type_type.getattr("__getattribute__").ok()?;
+        let exception_type = error.get_type(py);
+        let mro = getattribute
+            .call1((&exception_type, "__mro__"))
+            .ok()?
+            .cast_into::<PyTuple>()
+            .ok()?;
+
+        for base in mro.iter() {
+            let namespace = getattribute.call1((&base, "__dict__")).ok()?;
+            let Ok(value) = namespace.get_item(FAILURE_KIND_ATTRIBUTE) else {
+                continue;
+            };
+            let Ok(value) = value.extract::<String>() else {
+                return None;
+            };
+            return match value.as_str() {
+                "terminal" => Some(PythonDataSourceFailure::Terminal),
+                "transient" => Some(PythonDataSourceFailure::Transient),
+                _ => None,
+            };
+        }
+        None
+    })
+}
 
 /// Result type alias for Python data source operations.
 #[expect(dead_code)]
@@ -30,6 +65,9 @@ pub enum PythonDataSourceError {
     /// Resource exhaustion (e.g., partition too large)
     #[error("Resource exhausted: {0}")]
     ResourceExhausted(String),
+    /// Application-declared failure with private Python details discarded.
+    #[error("{0}")]
+    DeclaredFailure(#[from] PythonDataSourceFailure),
 }
 
 impl PythonDataSourceError {
@@ -92,7 +130,10 @@ impl PythonDataSourceContext {
 
     /// Wrap a Python error with context information, preserving traceback.
     pub fn wrap_py_error(&self, e: pyo3::PyErr) -> PythonDataSourceError {
-        self.wrap_error(format_py_error_with_traceback(e))
+        match declared_failure_kind(&e) {
+            Some(failure) => failure.into(),
+            None => self.wrap_error(format_py_error_with_traceback(e)),
+        }
     }
 }
 
@@ -125,7 +166,10 @@ pub fn format_py_error_with_traceback(e: pyo3::PyErr) -> String {
 
 impl From<pyo3::PyErr> for PythonDataSourceError {
     fn from(e: pyo3::PyErr) -> Self {
-        Self::python(format_py_error_with_traceback(e))
+        match declared_failure_kind(&e) {
+            Some(failure) => failure.into(),
+            None => Self::python(format_py_error_with_traceback(e)),
+        }
     }
 }
 
@@ -134,9 +178,12 @@ impl From<pyo3::PyErr> for PythonDataSourceError {
 /// This is a shared helper to avoid duplicating this conversion pattern
 /// across multiple modules (stream.rs, executor.rs, arrow_utils.rs, etc.).
 pub fn py_err(e: pyo3::PyErr) -> DataFusionError {
-    DataFusionError::External(Box::new(std::io::Error::other(
-        format_py_error_with_traceback(e),
-    )))
+    match declared_failure_kind(&e) {
+        Some(failure) => PythonDataSourceError::from(failure).into(),
+        None => DataFusionError::External(Box::new(std::io::Error::other(
+            format_py_error_with_traceback(e),
+        ))),
+    }
 }
 
 /// Import cloudpickle from PySpark.
@@ -153,4 +200,64 @@ pub fn import_cloudpickle(
             e
         ))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pyo3::ffi::c_str;
+    use pyo3::prelude::*;
+    use pyo3::types::{PyDict, PyDictMethods};
+
+    #[expect(clippy::unwrap_used)]
+    fn declared_error(kind: &str) -> PyErr {
+        Python::initialize();
+        Python::attach(|py| {
+            let namespace = PyDict::new(py);
+            namespace.set_item("failure_kind", kind).unwrap();
+            py.run(
+                c_str!(
+                    "class DeclaredError(RuntimeError):\n    __sail_data_source_failure_kind__ = failure_kind\n"
+                ),
+                Some(&namespace),
+                None,
+            )
+            .unwrap();
+            let exception_type = namespace.get_item("DeclaredError").unwrap().unwrap();
+            let value = exception_type.call1(("private Python detail",)).unwrap();
+            PyErr::from_value(value)
+        })
+    }
+
+    fn assert_declared_failure_is_constant(kind: &str, message: &str) -> Result<(), String> {
+        match py_err(declared_error(kind)) {
+            DataFusionError::External(error) => {
+                assert_eq!(error.to_string(), message);
+                assert!(!error.to_string().contains("private Python detail"));
+                let Some(source) = error.source() else {
+                    return Err("classified marker source was not preserved".to_string());
+                };
+                assert_eq!(source.to_string(), message);
+                assert!(source.source().is_none());
+                Ok(())
+            }
+            other => Err(format!("expected external error, got {other:?}")),
+        }
+    }
+
+    #[test]
+    fn test_terminal_declared_failure_preserves_only_finite_marker() -> Result<(), String> {
+        assert_declared_failure_is_constant(
+            "terminal",
+            "Python data source reported a terminal failure",
+        )
+    }
+
+    #[test]
+    fn test_transient_declared_failure_preserves_only_finite_marker() -> Result<(), String> {
+        assert_declared_failure_is_constant(
+            "transient",
+            "Python data source reported a transient failure",
+        )
+    }
 }

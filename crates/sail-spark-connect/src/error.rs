@@ -8,7 +8,7 @@ use datafusion::common::DataFusionError;
 use prost::{DecodeError, UnknownEnumValue};
 use sail_cache::error::CacheError;
 use sail_common::error::CommonError;
-use sail_common_datafusion::error::{CommonErrorCause, PythonErrorCause};
+use sail_common_datafusion::error::{CommonErrorCause, PythonErrorCause, PythonFailureKind};
 use sail_execution::error::ExecutionError;
 use sail_plan::error::PlanError;
 use sail_python_udf::error::PyErrExtractor;
@@ -369,21 +369,31 @@ impl From<CommonErrorCause> for SparkThrowable {
                 SparkThrowable::ArithmeticException(x)
             }
             CommonErrorCause::ArrowParse(x) => SparkThrowable::ParseException(x),
-            CommonErrorCause::Python(PythonErrorCause { summary, traceback }) => {
-                // The message must end with a newline character
-                // since the PySpark unit tests expect it.
-                let message = if let Some(traceback) = traceback {
-                    // Each line string already ends with a newline character.
-                    traceback.join("")
-                } else {
-                    format!("{summary}\n")
-                };
-                if message.contains("net.razorvine.pickle.PickleException") {
-                    SparkThrowable::SparkException(message)
-                } else {
-                    SparkThrowable::PythonException(message)
+            CommonErrorCause::Python(PythonErrorCause {
+                summary,
+                traceback,
+                failure_kind,
+            }) => match failure_kind {
+                Some(PythonFailureKind::Terminal) => SparkThrowable::AnalysisException(summary),
+                Some(PythonFailureKind::Transient) => {
+                    SparkThrowable::SparkRuntimeException(summary)
                 }
-            }
+                None => {
+                    // The message must end with a newline character
+                    // since the PySpark unit tests expect it.
+                    let message = if let Some(traceback) = traceback {
+                        // Each line string already ends with a newline character.
+                        traceback.join("")
+                    } else {
+                        format!("{summary}\n")
+                    };
+                    if message.contains("net.razorvine.pickle.PickleException") {
+                        SparkThrowable::SparkException(message)
+                    } else {
+                        SparkThrowable::PythonException(message)
+                    }
+                }
+            },
             CommonErrorCause::ArrowCast(x) => cast_error_to_throwable(x),
             CommonErrorCause::Schema(x)
             | CommonErrorCause::Plan(x)

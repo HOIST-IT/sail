@@ -59,9 +59,34 @@ impl PythonErrorCauseExtractor for PyErrExtractor {
             Some(PythonErrorCause {
                 summary: e.to_string(),
                 traceback: traceback.ok(),
+                failure_kind: None,
             })
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pyo3::exceptions::PyRuntimeError;
+
+    #[test]
+    #[expect(clippy::unwrap_used)]
+    fn test_generic_python_error_ignores_data_source_attribute() {
+        Python::initialize();
+        let error = Python::attach(|py| {
+            let error = PyRuntimeError::new_err("generic Python detail");
+            error
+                .value(py)
+                .setattr("__sail_data_source_failure_kind__", "terminal")
+                .unwrap();
+            error
+        });
+
+        let cause = PyErrExtractor::extract(&error).unwrap();
+        assert_eq!(cause.failure_kind, None);
+        assert!(cause.summary.contains("generic Python detail"));
     }
 }
