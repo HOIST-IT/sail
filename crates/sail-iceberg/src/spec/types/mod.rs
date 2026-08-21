@@ -412,15 +412,29 @@ impl PrimitiveType {
                 PL::String(val)
             }
             PrimitiveType::Uuid => {
-                return Err("uuid bound decoding not supported".to_string());
+                let value = u128::from_be_bytes(
+                    bytes
+                        .try_into()
+                        .map_err(|_| "Invalid 16-byte UUID bound".to_string())?,
+                );
+                PL::UInt128(value)
             }
             PrimitiveType::Fixed(_)
             | PrimitiveType::Binary
-            | PrimitiveType::Variant
             | PrimitiveType::Geometry { .. }
             | PrimitiveType::Geography { .. } => PL::Binary(bytes.to_vec()),
+            PrimitiveType::Variant => {
+                return Err("variant bound decoding not supported".to_string());
+            }
             PrimitiveType::Decimal { .. } => {
-                return Err("decimal bound decoding not supported".to_string());
+                if bytes.is_empty() || bytes.len() > size_of::<i128>() {
+                    return Err("Invalid signed decimal bound bytes".to_string());
+                }
+                let fill = if bytes[0] & 0x80 == 0 { 0 } else { u8::MAX };
+                let mut value = [fill; size_of::<i128>()];
+                let offset = value.len() - bytes.len();
+                value[offset..].copy_from_slice(bytes);
+                PL::Int128(i128::from_be_bytes(value))
             }
             PrimitiveType::Unknown => {
                 return Err("unknown bound decoding is only valid for null values".to_string());

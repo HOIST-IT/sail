@@ -148,10 +148,10 @@ impl PruningStatistics for IcebergPruningStats {
         if let Some(arr) = self.nulls_cache.borrow().get(&field_id) {
             return Some(arr.clone());
         }
-        let counts: Vec<u64> = self
+        let counts: Vec<Option<u64>> = self
             .files
             .iter()
-            .map(|f| f.null_value_counts().get(&field_id).copied().unwrap_or(0))
+            .map(|f| f.null_value_counts().get(&field_id).copied())
             .collect();
         let arr: ArrayRef = Arc::new(UInt64Array::from(counts));
         self.nulls_cache.borrow_mut().insert(field_id, arr.clone());
@@ -170,29 +170,50 @@ impl PruningStatistics for IcebergPruningStats {
 
     fn contained(
         &self,
-        _column: &Column,
-        _value: &std::collections::HashSet<datafusion::common::scalar::ScalarValue>,
+        column: &Column,
+        values: &std::collections::HashSet<datafusion::common::scalar::ScalarValue>,
     ) -> Option<BooleanArray> {
-        let field_id = self.field_id_for(_column)?;
+        use std::cmp::Ordering::{Equal, Less};
+
+        let field_id = self.field_id_for(column)?;
         let mut result = Vec::with_capacity(self.files.len());
-        for f in &self.files {
-            let lower = f.lower_bounds().get(&field_id);
-            let upper = f.upper_bounds().get(&field_id);
-            if let (Some(lb), Some(ub)) = (lower, upper) {
-                let lb_sv = self.datum_to_scalar_for_field(field_id, lb);
-                let ub_sv = self.datum_to_scalar_for_field(field_id, ub);
-                let mut any_match = false;
-                for v in _value.iter() {
-                    if &lb_sv == v && &ub_sv == v {
-                        any_match = true;
+        for file in &self.files {
+            let Some(lower) = file.lower_bounds().get(&field_id) else {
+                result.push(None);
+                continue;
+            };
+            let Some(upper) = file.upper_bounds().get(&field_id) else {
+                result.push(None);
+                continue;
+            };
+            let lower = self.datum_to_scalar_for_field(field_id, lower);
+            let upper = self.datum_to_scalar_for_field(field_id, upper);
+            if lower == upper && values.contains(&lower) {
+                result.push(Some(true));
+                continue;
+            }
+            if !matches!(lower.partial_cmp(&upper), Some(Less | Equal)) {
+                result.push(None);
+                continue;
+            }
+
+            let mut comparable = true;
+            let mut may_match = false;
+            for value in values {
+                match (lower.partial_cmp(value), value.partial_cmp(&upper)) {
+                    (Some(Less | Equal), Some(Less | Equal)) => may_match = true,
+                    (Some(_), Some(_)) => {}
+                    _ => {
+                        comparable = false;
                         break;
                     }
                 }
-                result.push(any_match);
-            } else {
-                // If stats are missing, we cannot safely prune the file.
-                result.push(true);
             }
+            result.push(if comparable && !may_match {
+                Some(false)
+            } else {
+                None
+            });
         }
         Some(BooleanArray::from(result))
     }
@@ -807,4 +828,122 @@ fn collect_source_range_filters(
         visit_expr(&mut result, schema, expr);
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use datafusion::arrow::array::Array;
+    use datafusion::arrow::datatypes::{DataType, Field};
+    use datafusion::common::ScalarValue;
+
+    use super::*;
+    use crate::spec::manifest::{DataContentType, DataFileFormat};
+    use crate::spec::types::NestedField;
+
+    fn data_file(path: &str, lower: i32, upper: i32) -> DataFile {
+        let bound = |value| Datum::new(PrimitiveType::Int, PrimitiveLiteral::Int(value));
+        DataFile {
+            content: DataContentType::Data,
+            file_path: path.to_string(),
+            file_format: DataFileFormat::Parquet,
+            partition: vec![],
+            record_count: 2,
+            file_size_in_bytes: 100,
+            column_sizes: HashMap::new(),
+            value_counts: HashMap::new(),
+            null_value_counts: HashMap::from([(1, 0)]),
+            nan_value_counts: HashMap::new(),
+            lower_bounds: HashMap::from([(1, bound(lower))]),
+            upper_bounds: HashMap::from([(1, bound(upper))]),
+            block_size_in_bytes: None,
+            key_metadata: None,
+            split_offsets: vec![],
+            equality_ids: vec![],
+            sort_order_id: None,
+            first_row_id: None,
+            partition_spec_id: 0,
+            referenced_data_file: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+        }
+    }
+
+    #[test]
+    fn missing_null_count_is_unknown() -> Result<()> {
+        let schema = Schema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Int),
+            ))])
+            .build()
+            .map_err(datafusion::common::DataFusionError::Execution)?;
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            true,
+        )]));
+        let mut file = data_file("data/missing-null-count.parquet", 1, 2);
+        file.null_value_counts.clear();
+        let stats = IcebergPruningStats::new(vec![file], arrow_schema, &schema);
+
+        let counts = stats.null_counts(&Column::from_name("id")).ok_or_else(|| {
+            datafusion::common::DataFusionError::Internal(
+                "expected null-count statistics".to_string(),
+            )
+        })?;
+        let counts = counts
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| {
+                datafusion::common::DataFusionError::Internal(
+                    "null counts must be UInt64".to_string(),
+                )
+            })?;
+
+        assert!(counts.is_null(0));
+        Ok(())
+    }
+
+    #[test]
+    fn contained_distinguishes_exact_disjoint_and_overlapping_ranges() -> Result<()> {
+        let schema = Schema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Int),
+            ))])
+            .build()
+            .map_err(datafusion::common::DataFusionError::Execution)?;
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            true,
+        )]));
+        let stats = IcebergPruningStats::new(
+            vec![
+                data_file("data/exact.parquet", 1, 1),
+                data_file("data/disjoint.parquet", 10, 10),
+                data_file("data/overlapping.parquet", 1, 2),
+            ],
+            arrow_schema,
+            &schema,
+        );
+        let values = HashSet::from([ScalarValue::Int32(Some(1))]);
+
+        let result = stats
+            .contained(&Column::from_name("id"), &values)
+            .ok_or_else(|| {
+                datafusion::common::DataFusionError::Internal(
+                    "expected contained statistics".to_string(),
+                )
+            })?;
+
+        assert!(result.value(0));
+        assert!(!result.value(1));
+        assert!(result.is_null(2));
+        Ok(())
+    }
 }

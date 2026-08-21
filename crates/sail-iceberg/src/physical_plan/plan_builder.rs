@@ -45,6 +45,7 @@ pub struct IcebergPlanBuilder<'a> {
     expected_snapshot_id: Option<Option<i64>>,
     removed_data_file_paths: Vec<String>,
     dynamic_partition_overwrite: bool,
+    snapshot_update_kind: Option<SnapshotUpdateKind>,
     #[expect(unused)]
     session: &'a dyn Session,
 }
@@ -65,6 +66,7 @@ impl<'a> IcebergPlanBuilder<'a> {
             expected_snapshot_id: None,
             removed_data_file_paths: Vec::new(),
             dynamic_partition_overwrite: false,
+            snapshot_update_kind: None,
             session,
         }
     }
@@ -81,6 +83,11 @@ impl<'a> IcebergPlanBuilder<'a> {
 
     pub fn with_dynamic_partition_overwrite(mut self, enabled: bool) -> Self {
         self.dynamic_partition_overwrite = enabled;
+        self
+    }
+
+    pub fn with_snapshot_update_kind(mut self, kind: SnapshotUpdateKind) -> Self {
+        self.snapshot_update_kind = Some(kind);
         self
     }
 
@@ -172,17 +179,18 @@ impl<'a> IcebergPlanBuilder<'a> {
     }
 
     fn add_commit_node(&self, input: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
-        let snapshot_update_kind = if self.table_config.table_exists {
-            match &self.sink_mode {
-                PhysicalSinkMode::Overwrite => SnapshotUpdateKind::FullOverwrite,
-                PhysicalSinkMode::OverwriteIf { .. } | PhysicalSinkMode::OverwritePartitions => {
-                    SnapshotUpdateKind::CopyOnWrite
+        let snapshot_update_kind = self.snapshot_update_kind.unwrap_or({
+            if self.table_config.table_exists {
+                match &self.sink_mode {
+                    PhysicalSinkMode::Overwrite => SnapshotUpdateKind::FullOverwrite,
+                    PhysicalSinkMode::OverwriteIf { .. }
+                    | PhysicalSinkMode::OverwritePartitions => SnapshotUpdateKind::CopyOnWrite,
+                    _ => SnapshotUpdateKind::FastAppend,
                 }
-                _ => SnapshotUpdateKind::FastAppend,
+            } else {
+                SnapshotUpdateKind::FastAppend
             }
-        } else {
-            SnapshotUpdateKind::FastAppend
-        };
+        });
         Ok(Arc::new(
             crate::physical_plan::commit::commit_exec::IcebergCommitExec::new(
                 input,

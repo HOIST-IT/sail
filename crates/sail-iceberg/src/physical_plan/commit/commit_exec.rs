@@ -134,8 +134,10 @@ fn validate_scoped_overwrite_format(
     snapshot_update_kind: SnapshotUpdateKind,
     format_version: FormatVersion,
 ) -> Result<()> {
-    if matches!(snapshot_update_kind, SnapshotUpdateKind::CopyOnWrite)
-        && matches!(format_version, FormatVersion::V3)
+    if matches!(
+        snapshot_update_kind,
+        SnapshotUpdateKind::CopyOnWrite | SnapshotUpdateKind::CopyOnWriteDelete
+    ) && matches!(format_version, FormatVersion::V3)
     {
         return Err(DataFusionError::NotImplemented(
             "Iceberg v3 scoped overwrite is not supported until row lineage is preserved"
@@ -668,6 +670,11 @@ impl ExecutionPlan for IcebergCommitExec {
             // No-op path (e.g. IgnoreIfExists on existing table): no rows, no meta.
             if commit_meta.is_none() && added_data_files.is_empty() && added_delete_files.is_empty()
             {
+                if expected_snapshot_id.is_some() {
+                    return Err(DataFusionError::Internal(
+                        "validated Iceberg mutation produced no commit metadata".to_string(),
+                    ));
+                }
                 return commit_count_batch(schema, 0);
             }
 
@@ -697,8 +704,10 @@ impl ExecutionPlan for IcebergCommitExec {
             {
                 commit_info.requirements.push(requirement);
             }
-            if !matches!(snapshot_update_kind, SnapshotUpdateKind::CopyOnWrite)
-                && (dynamic_partition_overwrite || !planned_removed_data_file_paths.is_empty())
+            if !matches!(
+                snapshot_update_kind,
+                SnapshotUpdateKind::CopyOnWrite | SnapshotUpdateKind::CopyOnWriteDelete
+            ) && (dynamic_partition_overwrite || !planned_removed_data_file_paths.is_empty())
             {
                 return Err(DataFusionError::Internal(
                     "scoped overwrite requires a copy-on-write snapshot update".to_string(),
@@ -709,12 +718,11 @@ impl ExecutionPlan for IcebergCommitExec {
                     "dynamic partition overwrite cannot carry planned removal paths".to_string(),
                 ));
             }
-            if matches!(snapshot_update_kind, SnapshotUpdateKind::CopyOnWrite)
-                && commit_info.data_files.is_empty()
-                && planned_removed_data_file_paths.is_empty()
-            {
-                return commit_count_batch(schema, 0);
-            }
+            let validation_only_copy_on_write = matches!(
+                snapshot_update_kind,
+                SnapshotUpdateKind::CopyOnWrite | SnapshotUpdateKind::CopyOnWriteDelete
+            ) && commit_info.data_files.is_empty()
+                && planned_removed_data_file_paths.is_empty();
             let mut removed_data_file_paths = planned_removed_data_file_paths;
 
             let catalog_table = commit_info
@@ -775,6 +783,9 @@ impl ExecutionPlan for IcebergCommitExec {
 
             if latest_meta_res.is_err() {
                 Self::validate_requirements(None, &commit_info.requirements)?;
+                if validation_only_copy_on_write {
+                    return commit_count_batch(schema, 0);
+                }
                 if let Some(catalog_table) = catalog_metadata_update_table {
                     let bootstrap_result = bootstrap_new_table_with_style(
                         &table_url,
@@ -855,6 +866,9 @@ impl ExecutionPlan for IcebergCommitExec {
                     snapshot_update_kind,
                     table_meta.format_version,
                 )?;
+                if validation_only_copy_on_write {
+                    return commit_count_batch(schema, 0);
+                }
                 if dynamic_partition_overwrite {
                     let default_spec = table_meta.default_partition_spec().ok_or_else(|| {
                         DataFusionError::Plan(
@@ -1728,6 +1742,87 @@ mod tests {
             statistics: vec![],
             partition_statistics: vec![],
         }
+    }
+
+    fn validation_only_delete_input(table_url: &Url) -> Result<Arc<dyn ExecutionPlan>> {
+        let batch = encode_commit_meta(CommitMeta {
+            table_uri: table_url.to_string(),
+            row_count: 0,
+            ..Default::default()
+        })?;
+        let schema = iceberg_action_schema()?;
+        let input: Arc<dyn ExecutionPlan> =
+            MemorySourceConfig::try_new_from_batches(schema, vec![batch])?;
+        Ok(input)
+    }
+
+    #[test]
+    fn validation_only_delete_rejects_stale_snapshot_and_writes_no_metadata() -> Result<()> {
+        futures::executor::block_on(async {
+            let table_url = Url::parse("memory://strict-delete/table")
+                .map_err(|error| DataFusionError::Plan(error.to_string()))?;
+            let object_store = Arc::new(object_store::memory::InMemory::new());
+            let store_ctx = StoreContext::new(object_store.clone(), &table_url)?;
+            let metadata = table_metadata_at_snapshot(Some(2))
+                .to_json()
+                .map_err(|error| DataFusionError::External(Box::new(error)))?;
+            store_ctx
+                .prefixed
+                .put(
+                    &object_store::path::Path::from("metadata/v1.metadata.json"),
+                    object_store::PutPayload::from(Bytes::from(metadata)),
+                )
+                .await
+                .map_err(|error| DataFusionError::External(Box::new(error)))?;
+            let context = SessionContext::new();
+            context.runtime_env().register_object_store(
+                &Url::parse("memory://strict-delete")
+                    .map_err(|error| DataFusionError::Plan(error.to_string()))?,
+                object_store,
+            );
+
+            let stale: Arc<dyn ExecutionPlan> = Arc::new(
+                IcebergCommitExec::new(
+                    validation_only_delete_input(&table_url)?,
+                    table_url.clone(),
+                    None,
+                    SnapshotUpdateKind::CopyOnWriteDelete,
+                )
+                .with_expected_snapshot_id(Some(Some(1))),
+            );
+            let error = datafusion::physical_plan::collect(stale, context.task_ctx())
+                .await
+                .expect_err("advanced snapshot must reject a validation-only delete");
+            assert!(error.to_string().contains("expected snapshot Some(1)"));
+            assert!(error.to_string().contains("found Some(2)"));
+
+            let current: Arc<dyn ExecutionPlan> = Arc::new(
+                IcebergCommitExec::new(
+                    validation_only_delete_input(&table_url)?,
+                    table_url,
+                    None,
+                    SnapshotUpdateKind::CopyOnWriteDelete,
+                )
+                .with_expected_snapshot_id(Some(Some(2))),
+            );
+            let batches = datafusion::physical_plan::collect(current, context.task_ctx()).await?;
+            assert_eq!(batches.len(), 1);
+            let counts = batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| DataFusionError::Internal("count must be Int64".to_string()))?;
+            assert_eq!(counts.value(0), 0);
+
+            let metadata_objects = store_ctx
+                .prefixed
+                .list(Some(&object_store::path::Path::from("metadata")))
+                .try_collect::<Vec<_>>()
+                .await
+                .map_err(|error| DataFusionError::External(Box::new(error)))?;
+            assert_eq!(metadata_objects.len(), 1);
+            Ok(())
+        })
     }
 
     #[test]
