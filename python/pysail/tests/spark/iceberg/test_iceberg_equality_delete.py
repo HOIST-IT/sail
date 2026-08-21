@@ -381,10 +381,10 @@ def test_iceberg_sql_copy_on_write_delete_is_noop_for_empty_table(spark, tmp_pat
         before_metadata_path = _latest_metadata_path(table_path)
         before_parquet_files = _parquet_file_paths(table_path)
 
-        result = spark.sql(f"DELETE FROM {table_name} WHERE id = 1").collect()
+        result = spark.sql("DELETE FROM iceberg_delete_copy_on_write_empty WHERE id = 1").collect()
 
         assert [row["count"] for row in result] == [0]
-        assert spark.sql(f"SELECT * FROM {table_name}").collect() == []
+        assert spark.table(table_name).collect() == []
         assert _latest_metadata_path(table_path) == before_metadata_path
         assert _parquet_file_paths(table_path) == before_parquet_files
     finally:
