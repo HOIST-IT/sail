@@ -55,6 +55,28 @@ Feature: Iceberg scoped overwrite
       | 5  | A        | 100   |
       | 6  | A        | 200   |
 
+  Scenario: Predicate overwrite with empty input removes matching files
+    Given overwrite query into iceberg table iceberg_scoped_overwrite_table where category = 'A'
+      """
+      SELECT CAST(NULL AS BIGINT) AS id,
+             CAST(NULL AS STRING) AS category,
+             CAST(NULL AS BIGINT) AS value
+      WHERE FALSE
+      """
+    Then iceberg snapshot operation is overwrite
+    Then iceberg current snapshot summary matches snapshot
+    Then iceberg snapshot count is 3
+    When query
+      """
+      SELECT id, category, value
+      FROM iceberg_scoped_overwrite_table
+      ORDER BY id
+      """
+    Then query result ordered
+      | id | category | value |
+      | 2  | B        | 20    |
+      | 4  | B        | 40    |
+
   Scenario: Dynamic overwrite replaces only touched partitions and empty input is a no-op
     Given remember current iceberg data manifest paths
     Given overwrite partitions of iceberg table iceberg_scoped_overwrite_table with query

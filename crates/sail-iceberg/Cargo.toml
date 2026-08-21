@@ -21,6 +21,7 @@ sail-common = { path = "../sail-common" }
 sail-common-datafusion = { path = "../sail-common-datafusion" }
 sail-data-source = { path = "../sail-data-source" }
 sail-logical-plan = { path = "../sail-logical-plan" }
+sail-physical-plan = { path = "../sail-physical-plan" }
 sail-sql-analyzer = { path = "../sail-sql-analyzer" }
 
 # DataFusion dependencies
@@ -57,9 +58,6 @@ rust_decimal = { workspace = true }
 # base64 = { workspace = true }
 murmur3 = { workspace = true }
 educe = { workspace = true }
-
-[dev-dependencies]
-tokio = { workspace = true }
 
 [build-dependencies]
 sail-build-scripts = { path = "../sail-build-scripts" }

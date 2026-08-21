@@ -1,24 +1,19 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::common::{Result, not_impl_err};
+use datafusion::common::Result;
 use datafusion::datasource::TableProvider;
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::expr_rewriter::unnormalize_cols;
 use datafusion::logical_expr::{LogicalPlan, TableScan, UserDefinedLogicalNode};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
-use sail_common_datafusion::datasource::{RowLevelCommand, SourceInfo};
-use sail_data_source::options::ResolveOptions;
-use sail_logical_plan::merge::RowLevelWriteNode;
+use sail_logical_plan::merge::{MergeCardinalityCheckNode, RowLevelWriteNode};
+use sail_physical_plan::merge_cardinality_check::MergeCardinalityCheckExec;
 
 use crate::logical::IcebergTableSource;
-use crate::options::r#gen::IcebergWriteOptions;
-use crate::physical_plan::IcebergWriterExecOptions;
-use crate::table_format::{
-    IcebergWriteNode, build_iceberg_provider, plan_iceberg_write,
-    split_iceberg_write_options_and_table_properties,
-};
+use crate::physical::row_level_planner::plan_iceberg_row_level_write;
+use crate::table_format::{IcebergWriteNode, plan_iceberg_write};
 
 pub struct IcebergPhysicalPlanner;
 
@@ -26,7 +21,7 @@ pub struct IcebergPhysicalPlanner;
 impl ExtensionPlanner for IcebergPhysicalPlanner {
     async fn plan_extension(
         &self,
-        _planner: &dyn PhysicalPlanner,
+        planner: &dyn PhysicalPlanner,
         node: &dyn UserDefinedLogicalNode,
         logical_inputs: &[&LogicalPlan],
         physical_inputs: &[Arc<dyn ExecutionPlan>],
@@ -47,14 +42,31 @@ impl ExtensionPlanner for IcebergPhysicalPlanner {
                 .await
                 .map(Some);
         }
+
+        if let Some(node) = node.as_any().downcast_ref::<MergeCardinalityCheckNode>() {
+            let [input] = physical_inputs else {
+                return datafusion_common::internal_err!(
+                    "MergeCardinalityCheckNode requires exactly one physical input"
+                );
+            };
+            let exec = MergeCardinalityCheckExec::new(
+                Arc::clone(input),
+                node.target_row_id_col(),
+                node.target_present_col(),
+                node.source_present_col(),
+            )?;
+            return Ok(Some(Arc::new(exec)));
+        }
+
         if let Some(node) = node.as_any().downcast_ref::<RowLevelWriteNode>() {
             if !node.target_format().eq_ignore_ascii_case("iceberg") {
                 return Ok(None);
             }
-            return plan_iceberg_row_level_write(session_state, node)
+            return plan_iceberg_row_level_write(session_state, planner, node, physical_inputs)
                 .await
                 .map(Some);
         }
+
         Ok(None)
     }
 
@@ -78,43 +90,5 @@ impl ExtensionPlanner for IcebergPhysicalPlanner {
             )
             .await?;
         Ok(Some(plan))
-    }
-}
-
-async fn plan_iceberg_row_level_write(
-    session_state: &SessionState,
-    node: &RowLevelWriteNode,
-) -> Result<Arc<dyn ExecutionPlan>> {
-    match node.command() {
-        RowLevelCommand::Delete => {
-            let source_info = SourceInfo {
-                paths: vec![node.target_location().to_string()],
-                lakehouse_table: node.target_lakehouse_table().cloned(),
-                schema: None,
-                constraints: Default::default(),
-                partition_by: vec![],
-                bucket_by: None,
-                sort_order: vec![],
-                options: node.target_options().to_vec(),
-                read_case_sensitive: true,
-            };
-            let provider = build_iceberg_provider(session_state, source_info).await?;
-            let (clean_options, table_properties) =
-                split_iceberg_write_options_and_table_properties(node.target_options().to_vec())?;
-            let variant_shredding_option_presence =
-                IcebergWriterExecOptions::variant_shredding_option_presence(&clean_options);
-            let iceberg_options = IcebergWriteOptions::resolve(session_state, clean_options)?;
-            let mut writer_options = IcebergWriterExecOptions::from(iceberg_options);
-            writer_options
-                .apply_variant_shredding_option_presence(variant_shredding_option_presence);
-            writer_options.table_properties = table_properties;
-            writer_options.lakehouse_table = node.target_lakehouse_table().cloned();
-            provider
-                .build_cow_delete_plan(session_state, node.condition().cloned(), writer_options)
-                .await
-        }
-        RowLevelCommand::Update | RowLevelCommand::Merge => {
-            not_impl_err!("Iceberg {:?} row-level write", node.command())
-        }
     }
 }

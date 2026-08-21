@@ -1,4 +1,3 @@
-@to_date
 Feature: to_date with an argument coming from a column
   # A behaviour-governing argument given as a literal is constant-folded, so the literal
   # scenarios never exercise the columnar kernel. These scenarios pass the same argument
@@ -6,7 +5,7 @@ Feature: to_date with an argument coming from a column
 
   Rule: to_date — the argument may come from a column
 
-    @column_args
+    @function(columnargs)
     Scenario: to_date with the argument as a literal
       When query
         """
@@ -16,7 +15,7 @@ Feature: to_date with an argument coming from a column
         | result     |
         | 2016-12-31 |
 
-    @column_args
+    @function(columnargs)
     Scenario: to_date takes argument 2 from a column
       When query
         """
@@ -26,6 +25,95 @@ Feature: to_date with an argument coming from a column
         | result     |
         | 2016-12-31 |
         | 2016-12-31 |
+
+  Rule: Invalid string input follows ANSI mode
+
+    Scenario Outline: To date returns NULL for <case> with ANSI disabled
+      Given config spark.sql.ansi.enabled = false
+      When query
+        """
+        SELECT to_date(<args>) AS result
+        """
+      Then query result
+        | result |
+        | NULL   |
+
+      Examples:
+        | case                       | args                    |
+        | default invalid leap day   | '2026-02-29'            |
+        | default invalid month      | '2026-00-15'            |
+        | formatted invalid leap day | '20260229', 'yyyyMMdd' |
+        | formatted invalid month    | '20260015', 'yyyyMMdd' |
+
+    Scenario: To date returns NULL for invalid string columns with ANSI disabled
+      Given config spark.sql.ansi.enabled = false
+      When query
+        """
+        SELECT
+          id,
+          to_date(value) AS default_result,
+          to_date(compact_value, 'yyyyMMdd') AS formatted_result
+        FROM VALUES
+          (1, '2026-01-01', '20260101'),
+          (2, '2026-02-29', '20260229'),
+          (3, '2026-00-15', '20260015'),
+          (4, CAST(NULL AS STRING), CAST(NULL AS STRING))
+          AS t(id, value, compact_value)
+        ORDER BY id
+        """
+      Then query result ordered
+        | id | default_result | formatted_result |
+        | 1  | 2026-01-01     | 2026-01-01       |
+        | 2  | NULL           | NULL             |
+        | 3  | NULL           | NULL             |
+        | 4  | NULL           | NULL             |
+
+    Scenario Outline: To date rejects <case> literal with ANSI enabled
+      Given config spark.sql.ansi.enabled = true
+      When query
+        """
+        SELECT to_date(<args>) AS result
+        """
+      Then query error (?i)(CANNOT_PARSE_TIMESTAMP|CAST_INVALID_INPUT|invalid parsed (date|month)|out of range|DateValue)
+
+      Examples:
+        | case                       | args                    |
+        | default invalid leap day   | '2026-02-29'            |
+        | default invalid month      | '2026-00-15'            |
+        | formatted invalid leap day | '20260229', 'yyyyMMdd' |
+        | formatted invalid month    | '20260015', 'yyyyMMdd' |
+
+    Scenario Outline: To date rejects <case> column with ANSI enabled
+      Given config spark.sql.ansi.enabled = true
+      When query
+        """
+        SELECT <call> AS result FROM VALUES ('<value>') AS t(value)
+        """
+      Then query error (?i)(CANNOT_PARSE_TIMESTAMP|CAST_INVALID_INPUT|invalid parsed (date|month)|out of range|DateValue)
+
+      Examples:
+        | case                       | call                       | value      |
+        | default invalid leap day   | to_date(value)             | 2026-02-29 |
+        | default invalid month      | to_date(value)             | 2026-00-15 |
+        | formatted invalid leap day | to_date(value, 'yyyyMMdd') | 20260229   |
+        | formatted invalid month    | to_date(value, 'yyyyMMdd') | 20260015   |
+
+    Scenario Outline: To date <case> is nullable with ANSI disabled
+      Given config spark.sql.ansi.enabled = false
+      When query
+        """
+        SELECT to_date(<args>) AS result
+        """
+      Then query schema
+        """
+        root
+         |-- result: date (nullable = true)
+        """
+
+      Examples:
+        | case            | args                    |
+        | default format  | '2026-01-01'            |
+        | explicit format | '20260101', 'yyyyMMdd' |
 
   Rule: Explicit NULL format semantics
 
@@ -147,7 +235,7 @@ Feature: to_date with an argument coming from a column
         | true  |
         | false |
 
-  @spark_null
+  @function(nullability)
   Rule: Output schema
 
     Scenario Outline: a typed DATE with a literal format respects ANSI <ansi> nullability

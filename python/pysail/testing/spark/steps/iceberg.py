@@ -16,7 +16,8 @@ from urllib.request import url2pathname
 from pyiceberg.avro.file import AvroFile
 from pyiceberg.io.pyarrow import PyArrowFile, PyArrowFileIO
 from pyiceberg.manifest import MANIFEST_LIST_FILE_SCHEMAS, ManifestContent, PartitionFieldSummary
-from pyspark.sql import Row, functions as F
+from pyspark.sql import Row
+from pyspark.sql import functions as F  # noqa: N812
 from pytest_bdd import given, parsers, then
 
 from pysail.testing.spark.steps.delta import _get_by_path, _parse_expected_value
@@ -422,7 +423,7 @@ def _sanitize_iceberg_metadata(metadata: dict) -> dict:
     sanitized = dict(metadata)
 
     # Replace volatile IDs with placeholders
-    if "current-snapshot-id" in sanitized:
+    if sanitized.get("current-snapshot-id") not in (None, -1):
         sanitized["current-snapshot-id"] = "<snapshot-id>"
 
     # Replace UUIDs with placeholders

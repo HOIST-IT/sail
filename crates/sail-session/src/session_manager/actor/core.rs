@@ -2,14 +2,15 @@ use std::sync::Arc;
 
 use indexmap::IndexMap;
 use log::{info, warn};
+use sail_common::actor::{Actor, ActorAction, ActorContext, ActorHandle};
 use sail_execution::driver::{DriverHandle, DriverRegistryAccessor};
 use sail_execution::error::{ExecutionError, ExecutionResult};
 use sail_execution::{DriverId, IdGenerator};
-use sail_server::actor::{Actor, ActorAction, ActorContext, ActorHandle};
 
 use crate::session_manager::actor::SessionManagerActor;
-use crate::session_manager::event::SessionManagerEvent;
-use crate::session_manager::options::{SessionManagerComponents, SessionManagerOptions};
+use crate::session_manager::{
+    SessionManagerComponents, SessionManagerMessage, SessionManagerOptions,
+};
 
 struct SessionDriverRegistry {
     handle: ActorHandle<SessionManagerActor>,
@@ -20,7 +21,7 @@ impl DriverRegistryAccessor for SessionDriverRegistry {
     async fn get(&self, driver_id: DriverId) -> ExecutionResult<DriverHandle> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.handle
-            .send(SessionManagerEvent::GetDriver {
+            .send(SessionManagerMessage::GetDriver {
                 driver_id,
                 result: tx,
             })
@@ -32,7 +33,7 @@ impl DriverRegistryAccessor for SessionDriverRegistry {
 
 #[tonic::async_trait]
 impl Actor for SessionManagerActor {
-    type Message = SessionManagerEvent;
+    type Message = SessionManagerMessage;
     type Options = (SessionManagerOptions, SessionManagerComponents);
 
     fn name() -> &'static str {
@@ -70,39 +71,39 @@ impl Actor for SessionManagerActor {
 
     fn receive(&mut self, ctx: &mut ActorContext<Self>, message: Self::Message) -> ActorAction {
         match message {
-            SessionManagerEvent::GetOrCreateSession {
+            SessionManagerMessage::GetOrCreateSession {
                 session_id,
                 user_id,
                 result,
             } => self.handle_get_or_create_session(ctx, session_id, user_id, result),
-            SessionManagerEvent::ProbeIdleSession {
+            SessionManagerMessage::ProbeIdleSession {
                 session_id,
                 instant,
             } => self.handle_probe_idle_session(ctx, session_id, instant),
-            SessionManagerEvent::DeleteSession { session_id, result } => {
+            SessionManagerMessage::DeleteSession { session_id, result } => {
                 self.handle_delete_session(ctx, session_id, result)
             }
-            SessionManagerEvent::SetSessionHistory {
+            SessionManagerMessage::SetSessionHistory {
                 session_id,
                 history,
             } => self.handle_set_session_history(ctx, session_id, history),
-            SessionManagerEvent::SetSessionFailure { session_id } => {
+            SessionManagerMessage::SetSessionFailure { session_id } => {
                 self.handle_set_session_failure(ctx, session_id)
             }
-            SessionManagerEvent::ObserveState { observer } => {
+            SessionManagerMessage::ObserveState { observer } => {
                 self.handle_observe_state(ctx, observer)
             }
-            SessionManagerEvent::GetDriver { driver_id, result } => {
+            SessionManagerMessage::GetDriver { driver_id, result } => {
                 self.handle_get_driver(driver_id, result)
             }
-            SessionManagerEvent::Shutdown { result } => {
+            SessionManagerMessage::Shutdown { result } => {
                 self.shutdown_notifier = Some(result);
                 ActorAction::Stop
             }
         }
     }
 
-    async fn stop(mut self, _ctx: &mut ActorContext<Self>) {
+    async fn stop(mut self, ctx: &mut ActorContext<Self>) {
         // Keep the gateway available while drivers stop. Graceful gateway shutdown waits for
         // active task stream connections, which are owned by the drivers.
         let drivers = self.drivers.drain().collect::<Vec<_>>();
@@ -111,6 +112,7 @@ impl Actor for SessionManagerActor {
                 warn!("failed to shut down driver {driver_id}: {e}");
             }
         }
+        ctx.children_mut().join().await;
         if let Some(mut driver_gateway) = self.driver_gateway {
             driver_gateway.stop().await;
             info!("driver server has stopped");

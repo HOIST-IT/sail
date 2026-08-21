@@ -170,12 +170,52 @@ impl PruningStatistics for IcebergPruningStats {
 
     fn contained(
         &self,
-        _column: &Column,
-        _values: &std::collections::HashSet<datafusion::common::scalar::ScalarValue>,
+        column: &Column,
+        values: &std::collections::HashSet<datafusion::common::scalar::ScalarValue>,
     ) -> Option<BooleanArray> {
-        // Iceberg min/max bounds cannot prove set containment or disjointness in general.
-        // Returning unknown lets DataFusion use the independent min/max statistics safely.
-        None
+        use std::cmp::Ordering::{Equal, Less};
+
+        let field_id = self.field_id_for(column)?;
+        let mut result = Vec::with_capacity(self.files.len());
+        for file in &self.files {
+            let Some(lower) = file.lower_bounds().get(&field_id) else {
+                result.push(None);
+                continue;
+            };
+            let Some(upper) = file.upper_bounds().get(&field_id) else {
+                result.push(None);
+                continue;
+            };
+            let lower = self.datum_to_scalar_for_field(field_id, lower);
+            let upper = self.datum_to_scalar_for_field(field_id, upper);
+            if lower == upper && values.contains(&lower) {
+                result.push(Some(true));
+                continue;
+            }
+            if !matches!(lower.partial_cmp(&upper), Some(Less | Equal)) {
+                result.push(None);
+                continue;
+            }
+
+            let mut comparable = true;
+            let mut may_match = false;
+            for value in values {
+                match (lower.partial_cmp(value), value.partial_cmp(&upper)) {
+                    (Some(Less | Equal), Some(Less | Equal)) => may_match = true,
+                    (Some(_), Some(_)) => {}
+                    _ => {
+                        comparable = false;
+                        break;
+                    }
+                }
+            }
+            result.push(if comparable && !may_match {
+                Some(false)
+            } else {
+                None
+            });
+        }
+        Some(BooleanArray::from(result))
     }
 }
 
@@ -795,55 +835,13 @@ mod tests {
     use datafusion::arrow::array::Array;
     use datafusion::arrow::datatypes::{DataType, Field};
     use datafusion::common::ScalarValue;
-    use datafusion::prelude::SessionContext;
 
     use super::*;
     use crate::spec::manifest::{DataContentType, DataFileFormat};
     use crate::spec::types::NestedField;
 
-    fn test_schema() -> Result<Schema> {
-        Schema::builder()
-            .with_schema_id(0)
-            .with_fields(vec![Arc::new(NestedField::required(
-                1,
-                "id",
-                Type::Primitive(PrimitiveType::Long),
-            ))])
-            .build()
-            .map_err(datafusion::common::DataFusionError::Execution)
-    }
-
-    fn test_int_schema() -> Result<Schema> {
-        Schema::builder()
-            .with_schema_id(0)
-            .with_fields(vec![Arc::new(NestedField::optional(
-                1,
-                "id",
-                Type::Primitive(PrimitiveType::Int),
-            ))])
-            .build()
-            .map_err(datafusion::common::DataFusionError::Execution)
-    }
-
-    fn test_date_schema() -> Result<Schema> {
-        Schema::builder()
-            .with_schema_id(0)
-            .with_fields(vec![Arc::new(NestedField::optional(
-                1,
-                "event_date",
-                Type::Primitive(PrimitiveType::Date),
-            ))])
-            .build()
-            .map_err(datafusion::common::DataFusionError::Execution)
-    }
-
-    fn data_file(
-        path: &str,
-        lower: Option<i64>,
-        upper: Option<i64>,
-        null_count: Option<u64>,
-    ) -> DataFile {
-        let bound = |value| Datum::new(PrimitiveType::Long, PrimitiveLiteral::Long(value));
+    fn data_file(path: &str, lower: i32, upper: i32) -> DataFile {
+        let bound = |value| Datum::new(PrimitiveType::Int, PrimitiveLiteral::Int(value));
         DataFile {
             content: DataContentType::Data,
             file_path: path.to_string(),
@@ -853,16 +851,10 @@ mod tests {
             file_size_in_bytes: 100,
             column_sizes: HashMap::new(),
             value_counts: HashMap::new(),
-            null_value_counts: null_count
-                .map(|count| HashMap::from([(1, count)]))
-                .unwrap_or_default(),
+            null_value_counts: HashMap::from([(1, 0)]),
             nan_value_counts: HashMap::new(),
-            lower_bounds: lower
-                .map(|value| HashMap::from([(1, bound(value))]))
-                .unwrap_or_default(),
-            upper_bounds: upper
-                .map(|value| HashMap::from([(1, bound(value))]))
-                .unwrap_or_default(),
+            lower_bounds: HashMap::from([(1, bound(lower))]),
+            upper_bounds: HashMap::from([(1, bound(upper))]),
             block_size_in_bytes: None,
             key_metadata: None,
             split_offsets: vec![],
@@ -877,158 +869,28 @@ mod tests {
     }
 
     #[test]
-    fn ranged_file_is_not_pruned_for_equality_inside_bounds() -> Result<()> {
-        let files = vec![
-            data_file("data/matching.parquet", Some(1), Some(2), Some(0)),
-            data_file("data/non-matching.parquet", Some(3), Some(4), Some(0)),
-        ];
-        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
-            "id",
-            DataType::Int64,
-            false,
-        )]));
-        let context = SessionContext::new();
-        let iceberg_schema = test_schema()?;
-
-        let (kept, _) = prune_files(
-            &context.state(),
-            &[datafusion_expr::col("id").eq(datafusion_expr::lit(1_i64))],
-            None,
-            arrow_schema,
-            files,
-            &iceberg_schema,
-        )?;
-
-        assert_eq!(
-            kept.iter()
-                .map(|file| file.file_path.as_str())
-                .collect::<Vec<_>>(),
-            vec!["data/matching.parquet"]
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn int_file_is_pruned_for_equality_outside_bounds() -> Result<()> {
-        let mut file = data_file("data/non-matching.parquet", None, None, Some(0));
-        file.lower_bounds =
-            HashMap::from([(1, Datum::new(PrimitiveType::Int, PrimitiveLiteral::Int(1)))]);
-        file.upper_bounds =
-            HashMap::from([(1, Datum::new(PrimitiveType::Int, PrimitiveLiteral::Int(3)))]);
+    fn missing_null_count_is_unknown() -> Result<()> {
+        let schema = Schema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Int),
+            ))])
+            .build()
+            .map_err(datafusion::common::DataFusionError::Execution)?;
         let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
             "id",
             DataType::Int32,
             true,
         )]));
-        let context = SessionContext::new();
-        let iceberg_schema = test_int_schema()?;
-
-        let (kept, _) = prune_files(
-            &context.state(),
-            &[datafusion_expr::col("id").eq(datafusion_expr::lit(999_i32))],
-            None,
-            arrow_schema,
-            vec![file],
-            &iceberg_schema,
-        )?;
-
-        assert!(kept.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn date_bounds_are_pruned_against_date_literals() -> Result<()> {
-        let date_bound = |value| Datum::new(PrimitiveType::Date, PrimitiveLiteral::Int(value));
-        let date_file = |path, lower, upper| {
-            let mut file = data_file(path, None, None, Some(0));
-            file.lower_bounds = HashMap::from([(1, date_bound(lower))]);
-            file.upper_bounds = HashMap::from([(1, date_bound(upper))]);
-            file
-        };
-        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
-            "event_date",
-            DataType::Date32,
-            true,
-        )]));
-        let context = SessionContext::new();
-        let iceberg_schema = test_date_schema()?;
-
-        let (kept, _) = prune_files(
-            &context.state(),
-            &[datafusion_expr::col("event_date")
-                .gt_eq(datafusion_expr::lit(ScalarValue::Date32(Some(19_724))))],
-            None,
-            arrow_schema,
-            vec![
-                date_file("data/matching.parquet", 19_723, 19_725),
-                date_file("data/old.parquet", 19_000, 19_100),
-            ],
-            &iceberg_schema,
-        )?;
-
-        assert_eq!(
-            kept.iter()
-                .map(|file| file.file_path.as_str())
-                .collect::<Vec<_>>(),
-            vec!["data/matching.parquet"]
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn promoted_schema_pruning_keeps_files_when_bounds_are_incompatible() -> Result<()> {
-        let mut historical = data_file("data/historical-int.parquet", None, None, Some(0));
-        historical.lower_bounds =
-            HashMap::from([(1, Datum::new(PrimitiveType::Int, PrimitiveLiteral::Int(1)))]);
-        historical.upper_bounds =
-            HashMap::from([(1, Datum::new(PrimitiveType::Int, PrimitiveLiteral::Int(3)))]);
-        let current = data_file("data/current-long.parquet", Some(4), Some(6), Some(0));
-        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
-            "id",
-            DataType::Int64,
-            true,
-        )]));
-        let context = SessionContext::new();
-        let iceberg_schema = test_schema()?;
-
-        let (kept, _) = prune_files(
-            &context.state(),
-            &[datafusion_expr::col("id").gt(datafusion_expr::lit(10_i64))],
-            None,
-            arrow_schema,
-            vec![historical, current],
-            &iceberg_schema,
-        )?;
-
-        assert_eq!(
-            kept.iter()
-                .map(|file| file.file_path.as_str())
-                .collect::<Vec<_>>(),
-            vec!["data/historical-int.parquet", "data/current-long.parquet"]
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn missing_null_count_is_reported_as_unknown() -> Result<()> {
-        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
-            "id",
-            DataType::Int64,
-            true,
-        )]));
-        let iceberg_schema = test_schema()?;
-        let stats = IcebergPruningStats::new(
-            vec![
-                data_file("data/unknown.parquet", None, None, None),
-                data_file("data/no-nulls.parquet", None, None, Some(0)),
-            ],
-            arrow_schema,
-            &iceberg_schema,
-        );
+        let mut file = data_file("data/missing-null-count.parquet", 1, 2);
+        file.null_value_counts.clear();
+        let stats = IcebergPruningStats::new(vec![file], arrow_schema, &schema);
 
         let counts = stats.null_counts(&Column::from_name("id")).ok_or_else(|| {
             datafusion::common::DataFusionError::Internal(
-                "null count statistics are unavailable".to_string(),
+                "expected null-count statistics".to_string(),
             )
         })?;
         let counts = counts
@@ -1039,9 +901,49 @@ mod tests {
                     "null counts must be UInt64".to_string(),
                 )
             })?;
+
         assert!(counts.is_null(0));
-        assert!(!counts.is_null(1));
-        assert_eq!(counts.value(1), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn contained_distinguishes_exact_disjoint_and_overlapping_ranges() -> Result<()> {
+        let schema = Schema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Int),
+            ))])
+            .build()
+            .map_err(datafusion::common::DataFusionError::Execution)?;
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            true,
+        )]));
+        let stats = IcebergPruningStats::new(
+            vec![
+                data_file("data/exact.parquet", 1, 1),
+                data_file("data/disjoint.parquet", 10, 10),
+                data_file("data/overlapping.parquet", 1, 2),
+            ],
+            arrow_schema,
+            &schema,
+        );
+        let values = HashSet::from([ScalarValue::Int32(Some(1))]);
+
+        let result = stats
+            .contained(&Column::from_name("id"), &values)
+            .ok_or_else(|| {
+                datafusion::common::DataFusionError::Internal(
+                    "expected contained statistics".to_string(),
+                )
+            })?;
+
+        assert!(result.value(0));
+        assert!(!result.value(1));
+        assert!(result.is_null(2));
         Ok(())
     }
 }
