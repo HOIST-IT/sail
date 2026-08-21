@@ -6,6 +6,7 @@ use fastrace::Span;
 use fastrace::collector::SpanContext;
 use log::{info, warn};
 use sail_cache::remote_checkpoint::RemoteCheckpointRegistry;
+use sail_common::actor::{ActorAction, ActorContext};
 use sail_common_datafusion::extension::SessionExtensionAccessor;
 use sail_common_datafusion::session::activity::ActivityTracker;
 use sail_common_datafusion::session::job::{
@@ -17,19 +18,18 @@ use sail_common_datafusion::system::predicate::PredicateExt;
 use sail_execution::DriverId;
 use sail_execution::driver::DriverHandle;
 use sail_execution::error::ExecutionResult;
-use sail_server::actor::{ActorAction, ActorContext};
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
 use crate::error::{SessionError, SessionResult};
 use crate::session_factory::{ServerSessionInfo, SessionJobRunnerInfo};
 use crate::session_manager::actor::SessionManagerActor;
-use crate::session_manager::event::{SessionHistory, SessionManagerEvent};
 use crate::session_manager::session::{ServerSession, ServerSessionState};
+use crate::session_manager::{SessionHistory, SessionManagerMessage};
 
 struct SessionJobRunnerHistoryReporter {
     session_id: String,
-    session_manager: sail_server::actor::ActorHandle<SessionManagerActor>,
+    session_manager: sail_common::actor::ActorHandle<SessionManagerActor>,
 }
 
 #[tonic::async_trait]
@@ -37,7 +37,7 @@ impl JobRunnerHistoryReporter for SessionJobRunnerHistoryReporter {
     async fn report(self: Box<Self>, history: JobRunnerHistory) {
         let _ = self
             .session_manager
-            .send(SessionManagerEvent::SetSessionHistory {
+            .send(SessionManagerMessage::SetSessionHistory {
                 session_id: self.session_id,
                 history: SessionHistory {
                     job_runner: history,
@@ -92,15 +92,19 @@ impl SessionManagerActor {
                     return ActorAction::Continue;
                 }
             };
-            let runner = self.job_runner_factory.create(SessionJobRunnerInfo {
-                session_id: session_id.clone(),
-                driver_id,
-                driver_server_port: self.driver_gateway.as_ref().map(|x| x.port()),
-                history_reporter: Box::new(SessionJobRunnerHistoryReporter {
+            let session_manager = ctx.handle().clone();
+            let runner = self.job_runner_factory.create(
+                ctx.children_mut(),
+                SessionJobRunnerInfo {
                     session_id: session_id.clone(),
-                    session_manager: ctx.handle().clone(),
-                }),
-            });
+                    driver_id,
+                    driver_server_port: self.driver_gateway.as_ref().map(|x| x.port()),
+                    history_reporter: Box::new(SessionJobRunnerHistoryReporter {
+                        session_id: session_id.clone(),
+                        session_manager,
+                    }),
+                },
+            );
             match runner {
                 Ok(runner) => {
                     let (runner, driver) = runner.into_parts();
@@ -182,7 +186,7 @@ impl SessionManagerActor {
                 .and_then(|tracker| tracker.track_activity())
         {
             ctx.send_with_delay(
-                SessionManagerEvent::ProbeIdleSession {
+                SessionManagerMessage::ProbeIdleSession {
                     session_id,
                     instant: active_at,
                 },

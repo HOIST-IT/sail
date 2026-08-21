@@ -40,7 +40,13 @@ impl DataFileWriter {
         }
     }
 
-    pub fn finish(
+    /// Finish a delete-file write without collecting column bounds.
+    pub fn finish_without_bounds(self, meta: ParquetFileMeta) -> Result<WriteOutcome, String> {
+        let empty_schema = Schema::builder().with_schema_id(0).build()?;
+        self.finish_with_schema(meta, &empty_schema)
+    }
+
+    pub fn finish_with_schema(
         self,
         meta: ParquetFileMeta,
         iceberg_schema: &Schema,
@@ -323,6 +329,7 @@ mod tests {
     use datafusion::arrow::array::Int32Array;
     use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::prelude::{SessionContext, col, lit};
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use parquet::data_type::ByteArray;
     use parquet::file::properties::WriterProperties;
@@ -330,9 +337,8 @@ mod tests {
 
     use super::*;
     use crate::operations::write::arrow_parquet::ArrowParquetWriter;
-    use crate::spec::types::NestedField;
-    use crate::spec::types::PrimitiveType;
     use crate::spec::types::values::PrimitiveLiteral;
+    use crate::spec::types::{NestedField, PrimitiveType};
 
     #[test]
     fn parquet_integer_statistics_produce_iceberg_bounds() {
@@ -350,46 +356,94 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn data_file_writer_preserves_parquet_integer_bounds() -> Result<(), String> {
-        let arrow_schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
-                PARQUET_FIELD_ID_META_KEY.to_string(),
-                "1".to_string(),
-            )])),
-        ]));
-        let batch = RecordBatch::try_new(
-            arrow_schema.clone(),
-            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
-        )
-        .map_err(|error| error.to_string())?;
-        let mut parquet_writer = ArrowParquetWriter::try_new(
-            arrow_schema.as_ref(),
-            WriterProperties::builder().build(),
-        )?;
-        parquet_writer.write_batch(&batch).await?;
-        let (_, metadata) = parquet_writer.close().await?;
-        let iceberg_schema = Schema::builder()
-            .with_schema_id(0)
-            .with_fields(vec![Arc::new(NestedField::required(
-                1,
-                "id",
-                Type::Primitive(PrimitiveType::Int),
-            ))])
-            .build()?;
+    #[test]
+    fn data_file_writer_preserves_parquet_integer_bounds() -> Result<(), String> {
+        futures::executor::block_on(async {
+            let arrow_schema = Arc::new(ArrowSchema::new(vec![
+                Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                    PARQUET_FIELD_ID_META_KEY.to_string(),
+                    "1".to_string(),
+                )])),
+            ]));
+            let batch = RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+            )
+            .map_err(|error| error.to_string())?;
+            let mut parquet_writer = ArrowParquetWriter::try_new(
+                arrow_schema.as_ref(),
+                WriterProperties::builder().build(),
+            )?;
+            parquet_writer.write_batch(&batch).await?;
+            let (_, metadata) = parquet_writer.close().await?;
+            let iceberg_schema = Schema::builder()
+                .with_schema_id(0)
+                .with_fields(vec![Arc::new(NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Int),
+                ))])
+                .build()?;
 
-        let outcome = DataFileWriter::new(0, "data.parquet".to_string(), vec![])
-            .finish(metadata, &iceberg_schema)?;
+            let outcome = DataFileWriter::new(0, "data.parquet".to_string(), vec![])
+                .finish_with_schema(metadata, &iceberg_schema)?;
 
-        assert_eq!(
-            outcome.data_file.lower_bounds.get(&1),
-            Some(&Datum::new(PrimitiveType::Int, PrimitiveLiteral::Int(1)))
+            assert_eq!(
+                outcome.data_file.lower_bounds.get(&1),
+                Some(&Datum::new(PrimitiveType::Int, PrimitiveLiteral::Int(1)))
+            );
+            assert_eq!(
+                outcome.data_file.upper_bounds.get(&1),
+                Some(&Datum::new(PrimitiveType::Int, PrimitiveLiteral::Int(3)))
+            );
+
+            let session = SessionContext::new();
+            let (kept, mask) = crate::datasource::pruning::prune_files(
+                &session.state(),
+                &[col("id").gt(lit(10i32))],
+                None,
+                arrow_schema,
+                vec![outcome.data_file],
+                &iceberg_schema,
+            )
+            .map_err(|error| error.to_string())?;
+            assert!(kept.is_empty());
+            assert_eq!(mask, Some(vec![false]));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn aggregate_statistics_are_absent_when_any_file_metric_is_missing() {
+        let mut bounds = HashMap::new();
+        let mut unknown = HashSet::new();
+        update_bound(
+            &mut bounds,
+            &mut unknown,
+            1,
+            Some(Datum::new(PrimitiveType::Int, PrimitiveLiteral::Int(1))),
+            true,
         );
-        assert_eq!(
-            outcome.data_file.upper_bounds.get(&1),
-            Some(&Datum::new(PrimitiveType::Int, PrimitiveLiteral::Int(3)))
+        update_bound(&mut bounds, &mut unknown, 1, None, true);
+        update_bound(
+            &mut bounds,
+            &mut unknown,
+            1,
+            Some(Datum::new(PrimitiveType::Int, PrimitiveLiteral::Int(0))),
+            true,
         );
-        Ok(())
+        assert!(!bounds.contains_key(&1));
+        assert!(unknown.contains(&1));
+    }
+
+    #[test]
+    fn statistics_drop_bounds_that_do_not_match_current_arrow_type() {
+        let statistics = Statistics::int32(Some(1), Some(3), None, Some(0), false);
+
+        let (lower, upper) = parquet_statistics_bounds(&statistics, &PrimitiveType::String);
+
+        assert_eq!(lower, None);
+        assert_eq!(upper, None);
     }
 
     #[test]

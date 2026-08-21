@@ -15,7 +15,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema, SchemaRef};
+use datafusion::arrow::array::{Array, BooleanArray};
+use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::Session;
 use datafusion::catalog::memory::DataSourceExec;
 use datafusion::common::scalar::ScalarValue;
@@ -24,6 +26,7 @@ use datafusion::common::{Result, ToDFSchema, plan_err};
 use datafusion::config::TableParquetOptions;
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::{FileGroup, FileScanConfigBuilder, ParquetSource};
+use datafusion::datasource::table_schema::TableSchema;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::logical_expr::utils::conjunction;
@@ -45,7 +48,9 @@ use object_store::ObjectMeta;
 use sail_common_datafusion::catalog::CatalogPartitionField;
 use sail_common_datafusion::datasource::PhysicalSinkMode;
 use sail_common_datafusion::logical_expr::ExprWithSource;
-use sail_common_datafusion::schema_evolution::SchemaEvolutionPhysicalExprAdapterFactory;
+use sail_common_datafusion::schema_evolution::{
+    SchemaEvolutionPhysicalExprAdapterFactoryWithMatching, StructFieldMatching,
+};
 use url::Url;
 
 use crate::datasource::expressions::simplify_expr;
@@ -56,11 +61,15 @@ use crate::datasource::type_converter::iceberg_schema_to_arrow;
 use crate::io::{
     StoreContext, load_manifest as io_load_manifest, load_manifest_list as io_load_manifest_list,
 };
-use crate::physical_plan::IcebergWriterExecOptions;
 use crate::physical_plan::delete_apply_exec::IcebergDeleteApplyExec;
 use crate::physical_plan::discovery_exec::IcebergDiscoveryExec;
 use crate::physical_plan::manifest_scan_exec::IcebergManifestScanExec;
+use crate::physical_plan::merge_metadata_exec::IcebergMergeMetadataExec;
 use crate::physical_plan::plan_builder::{IcebergPlanBuilder, IcebergTableConfig};
+use crate::physical_plan::{IcebergWriteContext, IcebergWriterExecOptions};
+use crate::row_level_metadata::{
+    MERGE_PARTITION_COLUMN, MERGE_PARTITION_SPEC_ID_COLUMN, RowLevelMetadataColumns,
+};
 use crate::spec::delete_index::{DeleteFileIndex, DeleteFileRef};
 use crate::spec::transform::Transform;
 use crate::spec::types::Type;
@@ -71,10 +80,15 @@ use crate::spec::{
 };
 use crate::utils::conversions::{primitive_to_scalar_default, to_scalar};
 use crate::utils::get_object_store_from_session;
-use crate::utils::partition_transform::catalog_partition_field_from_iceberg;
+
+fn iceberg_schema_evolution_adapter() -> Arc<dyn PhysicalExprAdapterFactory> {
+    Arc::new(SchemaEvolutionPhysicalExprAdapterFactoryWithMatching::new(
+        StructFieldMatching::FieldId,
+    ))
+}
 
 /// Iceberg table provider for DataFusion
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct IcebergTableProvider {
     /// The table location (URI)
     table_uri: String,
@@ -88,6 +102,12 @@ pub struct IcebergTableProvider {
     default_spec_id: i32,
     /// Arrow schema for DataFusion
     arrow_schema: Arc<ArrowSchema>,
+    /// Output schema exposed to DataFusion; may include MERGE metadata columns.
+    output_schema: Arc<ArrowSchema>,
+    /// Optional file-path metadata column for row-level write planning.
+    file_column_name: Option<String>,
+    /// Optional file-local row-index metadata column for row-level write planning.
+    row_index_column_name: Option<String>,
     /// Whether to use the metadata-as-data read path (lazy manifest scanning)
     metadata_as_data_read: bool,
 }
@@ -126,7 +146,10 @@ impl IcebergTableProvider {
             snapshot: Some(snapshot),
             partition_specs,
             default_spec_id,
+            output_schema: arrow_schema.clone(),
             arrow_schema,
+            file_column_name: None,
+            row_index_column_name: None,
             metadata_as_data_read: false,
         })
     }
@@ -159,7 +182,10 @@ impl IcebergTableProvider {
             snapshot: None,
             partition_specs,
             default_spec_id,
+            output_schema: arrow_schema.clone(),
             arrow_schema,
+            file_column_name: None,
+            row_index_column_name: None,
             metadata_as_data_read: false,
         })
     }
@@ -168,6 +194,41 @@ impl IcebergTableProvider {
     pub fn with_metadata_as_data_read(mut self, enabled: bool) -> Self {
         self.metadata_as_data_read = enabled;
         self
+    }
+
+    pub fn file_column_name(&self) -> Option<&str> {
+        self.file_column_name.as_deref()
+    }
+
+    pub fn row_index_column_name(&self) -> Option<&str> {
+        self.row_index_column_name.as_deref()
+    }
+
+    pub fn with_file_column(mut self, name: &str) -> Result<Self> {
+        self.file_column_name = Some(name.to_string());
+        self.rebuild_output_schema()?;
+        Ok(self)
+    }
+
+    pub fn with_row_index_column(mut self, name: &str) -> Result<Self> {
+        self.row_index_column_name = Some(name.to_string());
+        self.rebuild_output_schema()?;
+        Ok(self)
+    }
+
+    fn rebuild_output_schema(&mut self) -> Result<()> {
+        let metadata_columns = RowLevelMetadataColumns::new(
+            self.file_column_name.as_deref(),
+            self.row_index_column_name.as_deref(),
+        );
+        let metadata_columns = if self.file_column_name.is_some() {
+            metadata_columns.with_delete_file_metadata()
+        } else {
+            metadata_columns
+        };
+        self.output_schema =
+            Arc::new(metadata_columns.append_to_schema(self.arrow_schema.as_ref())?);
+        Ok(())
     }
 
     fn reorder_arrow_schema_for_identity_partitions(
@@ -240,16 +301,265 @@ impl IcebergTableProvider {
         self.snapshot.as_ref()
     }
 
+    pub(crate) async fn predicate_overwrite_paths(
+        &self,
+        session: &dyn Session,
+        condition: &Expr,
+    ) -> Result<Vec<String>> {
+        if self.snapshot.is_none() {
+            return Ok(Vec::new());
+        }
+        let default_spec = self
+            .partition_specs
+            .iter()
+            .find(|spec| spec.spec_id() == self.default_spec_id)
+            .ok_or_else(|| {
+                datafusion::common::DataFusionError::Plan(
+                    "Iceberg table metadata has no default partition spec".to_string(),
+                )
+            })?;
+        let identity_fields = default_spec
+            .fields()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, field)| {
+                matches!(field.transform, Transform::Identity).then_some((field.source_id, index))
+            })
+            .collect::<HashMap<_, _>>();
+        for column in condition.column_refs() {
+            let field = self.schema.field_by_name(&column.name).ok_or_else(|| {
+                datafusion::common::DataFusionError::Plan(format!(
+                    "predicate overwrite column '{}' is not present in the Iceberg schema",
+                    column.name
+                ))
+            })?;
+            if !identity_fields.contains_key(&field.id) {
+                return Err(datafusion::common::DataFusionError::NotImplemented(
+                    format!(
+                        "Iceberg predicate overwrite supports only identity-partition columns; use DELETE ... WHERE followed by INSERT for '{}'",
+                        column.name
+                    ),
+                ));
+            }
+        }
+
+        let table_url = Url::parse(&self.table_uri)
+            .map_err(|error| datafusion::common::DataFusionError::External(Box::new(error)))?;
+        let object_store = get_object_store_from_session(session, &table_url)?;
+        let store_ctx = StoreContext::new(object_store, &table_url)?;
+        let manifest_list = self.load_manifest_list(&store_ctx).await?;
+        if !self
+            .build_delete_file_index(&store_ctx, &manifest_list)
+            .await?
+            .is_empty()
+        {
+            return plan_err!(
+                "copy-on-write predicate overwrite is not supported for Iceberg tables with active delete files"
+            );
+        }
+        let files = self
+            .load_data_files_with_seq(session, &[], &store_ctx, &manifest_list)
+            .await?
+            .into_iter()
+            .map(|(file, _)| file)
+            .collect::<Vec<_>>();
+        let df_schema = self.arrow_schema.clone().to_dfschema()?;
+        let predicate = session.create_physical_expr(condition.clone(), &df_schema)?;
+        let mut paths = Vec::new();
+        for file in files {
+            if file.partition_spec_id != default_spec.spec_id()
+                || file.partition.len() != default_spec.fields().len()
+            {
+                return Err(datafusion::common::DataFusionError::NotImplemented(
+                    "predicate overwrite is not supported for Iceberg tables with incomparable live partition specs"
+                        .to_string(),
+                ));
+            }
+            let columns = self
+                .arrow_schema
+                .fields()
+                .iter()
+                .map(|arrow_field| {
+                    let scalar = self
+                        .schema
+                        .field_by_name(arrow_field.name())
+                        .and_then(|field| identity_fields.get(&field.id).copied())
+                        .and_then(|index| file.partition.get(index))
+                        .and_then(Option::as_ref)
+                        .and_then(|literal| match literal {
+                            Literal::Primitive(value) => Some(primitive_to_scalar_default(value)),
+                            _ => None,
+                        })
+                        .map(Ok)
+                        .unwrap_or_else(|| ScalarValue::try_from(arrow_field.data_type()));
+                    scalar?.to_array_of_size(1)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let batch = RecordBatch::try_new(self.arrow_schema.clone(), columns)?;
+            let result = predicate.evaluate(&batch)?.into_array(1)?;
+            let result = result
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| {
+                    datafusion::common::DataFusionError::Plan(
+                        "Iceberg overwrite predicate did not evaluate to boolean".to_string(),
+                    )
+                })?;
+            if !result.is_null(0) && result.value(0) {
+                paths.push(file.file_path);
+            }
+        }
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
+    }
+
+    fn scan_data_files(
+        &self,
+        session: &dyn Session,
+        store_ctx: &StoreContext,
+        data_files: Vec<DataFile>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        if data_files.is_empty() {
+            return Ok(Arc::new(EmptyExec::new(self.arrow_schema.clone())));
+        }
+        let statistics = self.aggregate_statistics(&data_files);
+        let partitioned_files = self.create_partitioned_files(store_ctx, data_files)?;
+        let file_groups = self.create_file_groups(partitioned_files);
+        let parquet_source = self.build_parquet_source(session, None, &[], &[], false)?;
+        let file_scan_config = FileScanConfigBuilder::new(self.object_store_url()?, parquet_source)
+            .with_file_groups(file_groups)
+            .with_statistics(statistics)
+            .with_expr_adapter(Some(iceberg_schema_evolution_adapter()))
+            .build();
+        Ok(DataSourceExec::from_data_source(file_scan_config))
+    }
+
+    fn retain_delete_survivors(
+        session: &dyn Session,
+        input: Arc<dyn ExecutionPlan>,
+        condition: Option<ExprWithSource>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let Some(condition) = condition else {
+            return Ok(Arc::new(EmptyExec::new(input.schema())));
+        };
+        let schema = input.schema().to_dfschema()?;
+        let survivor_expr = Expr::IsNotTrue(Box::new(condition.expr));
+        let physical_expr = session.create_physical_expr(survivor_expr, &schema)?;
+        Ok(Arc::new(FilterExec::try_new(physical_expr, input)?))
+    }
+
+    pub(crate) async fn build_cow_delete_plan(
+        &self,
+        session: &dyn Session,
+        condition: Option<ExprWithSource>,
+        writer_options: IcebergWriterExecOptions,
+        partition_columns: Vec<CatalogPartitionField>,
+        write_context: IcebergWriteContext,
+        expected_snapshot_id: Option<Option<i64>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let table_url = Url::parse(&self.table_uri)
+            .map_err(|error| datafusion::common::DataFusionError::External(Box::new(error)))?;
+        let (candidate_scan, removed_data_file_paths, candidate_row_count) = if self
+            .snapshot
+            .is_some()
+        {
+            let object_store = get_object_store_from_session(session, &table_url)?;
+            let store_ctx = StoreContext::new(object_store, &table_url)?;
+            let manifest_list = self.load_manifest_list(&store_ctx).await?;
+            if !self
+                .build_delete_file_index(&store_ctx, &manifest_list)
+                .await?
+                .is_empty()
+            {
+                return plan_err!(
+                    "copy-on-write DELETE is not supported for Iceberg tables with active delete files"
+                );
+            }
+            let filters = condition
+                .iter()
+                .map(|condition| condition.expr.clone())
+                .collect::<Vec<_>>();
+            let candidates = self
+                .load_data_files_with_seq(session, &filters, &store_ctx, &manifest_list)
+                .await?
+                .into_iter()
+                .map(|(data_file, _)| data_file)
+                .collect::<Vec<_>>();
+            let candidate_row_count = candidates.iter().try_fold(0_u64, |count, data_file| {
+                count.checked_add(data_file.record_count()).ok_or_else(|| {
+                    datafusion::common::DataFusionError::Execution(
+                        "Iceberg DELETE candidate row count overflow".to_string(),
+                    )
+                })
+            })?;
+            let removed_data_file_paths = candidates
+                .iter()
+                .map(|data_file| data_file.file_path.clone())
+                .collect();
+            (
+                self.scan_data_files(session, &store_ctx, candidates)?,
+                removed_data_file_paths,
+                candidate_row_count,
+            )
+        } else {
+            (
+                Arc::new(EmptyExec::new(self.arrow_schema.clone())) as Arc<dyn ExecutionPlan>,
+                vec![],
+                0,
+            )
+        };
+        let survivor_plan =
+            Self::retain_delete_survivors(session, candidate_scan, condition.clone())?;
+        let sink_mode = PhysicalSinkMode::OverwriteIf {
+            source: condition
+                .as_ref()
+                .and_then(|condition| condition.source.clone()),
+            condition: condition.map(Box::new),
+        };
+        let table_config = IcebergTableConfig {
+            table_url,
+            partition_columns,
+            table_exists: true,
+            options: writer_options,
+            write_context,
+        };
+        let commit_plan =
+            IcebergPlanBuilder::new(survivor_plan, table_config, sink_mode, None, session)
+                .with_expected_snapshot_id(expected_snapshot_id)
+                .with_removed_data_file_paths(removed_data_file_paths)
+                .with_snapshot_update_kind(crate::operations::SnapshotUpdateKind::CopyOnWriteDelete)
+                .build()
+                .await?;
+
+        let candidate_row_count = i64::try_from(candidate_row_count).map_err(|error| {
+            datafusion::common::DataFusionError::Execution(format!(
+                "Iceberg DELETE candidate row count overflow: {error}"
+            ))
+        })?;
+        let affected_count: Arc<dyn PhysicalExpr> = Arc::new(PhysicalBinaryExpr::new(
+            Arc::new(PhysicalLiteral::new(ScalarValue::Int64(Some(
+                candidate_row_count,
+            )))),
+            Operator::Minus,
+            Arc::new(Column::new("count", 0)),
+        ));
+        Ok(Arc::new(ProjectionExec::try_new(
+            vec![(affected_count, "count".to_string())],
+            commit_plan,
+        )?))
+    }
+
     fn projected_arrow_schema(&self, projection: Option<&Vec<usize>>) -> Result<Arc<ArrowSchema>> {
         match projection {
             Some(projection) => {
                 let fields = projection
                     .iter()
-                    .map(|idx| self.arrow_schema.field(*idx).clone())
+                    .map(|idx| self.output_schema.field(*idx).clone())
                     .collect::<Vec<_>>();
                 Ok(Arc::new(ArrowSchema::new(fields)))
             }
-            None => Ok(self.arrow_schema.clone()),
+            None => Ok(self.output_schema.clone()),
         }
     }
 
@@ -475,6 +785,36 @@ impl IcebergTableProvider {
         Ok(partitioned_files)
     }
 
+    fn create_merge_partitioned_files(
+        &self,
+        store_ctx: &StoreContext,
+        data_files: Vec<DataFile>,
+    ) -> Result<Vec<PartitionedFile>> {
+        let file_metadata = data_files
+            .iter()
+            .map(|file| {
+                Ok((
+                    file.file_path.clone(),
+                    file.partition_spec_id,
+                    serde_json::to_string(&file.partition).map_err(|error| {
+                        datafusion::common::DataFusionError::External(Box::new(error))
+                    })?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut partitioned_files = self.create_partitioned_files(store_ctx, data_files)?;
+        for (partitioned_file, (file_path, partition_spec_id, partition_json)) in
+            partitioned_files.iter_mut().zip(file_metadata)
+        {
+            partitioned_file.partition_values = vec![
+                ScalarValue::Utf8(Some(file_path)),
+                ScalarValue::Int32(Some(partition_spec_id)),
+                ScalarValue::Utf8(Some(partition_json)),
+            ];
+        }
+        Ok(partitioned_files)
+    }
+
     /// Create file groups from partitioned files
     fn create_file_groups(&self, partitioned_files: Vec<PartitionedFile>) -> Vec<FileGroup> {
         // Group files by partition values
@@ -525,6 +865,30 @@ impl IcebergTableProvider {
         Ok(Arc::new(parquet_source))
     }
 
+    fn build_merge_parquet_source(
+        &self,
+        session: &dyn Session,
+        file_column_name: &str,
+    ) -> Arc<dyn datafusion::datasource::physical_plan::FileSource> {
+        let parquet_options = TableParquetOptions {
+            global: session.config().options().execution.parquet.clone(),
+            ..Default::default()
+        };
+        let table_schema = TableSchema::new(
+            self.arrow_schema.clone(),
+            vec![
+                Arc::new(Field::new(file_column_name, DataType::Utf8, false)),
+                Arc::new(Field::new(
+                    MERGE_PARTITION_SPEC_ID_COLUMN,
+                    DataType::Int32,
+                    false,
+                )),
+                Arc::new(Field::new(MERGE_PARTITION_COLUMN, DataType::Utf8, false)),
+            ],
+        );
+        Arc::new(ParquetSource::new(table_schema).with_table_parquet_options(parquet_options))
+    }
+
     fn expanded_projection(
         &self,
         projection: Option<&Vec<usize>>,
@@ -559,7 +923,7 @@ impl IcebergTableProvider {
             .collect()
     }
 
-    fn datum_to_scalar(datum: &Datum, arrow_type: &ArrowDataType) -> Option<ScalarValue> {
+    fn datum_to_scalar(datum: &Datum, arrow_type: &DataType) -> Option<ScalarValue> {
         let iceberg_type = Type::Primitive(datum.r#type.clone());
         match to_scalar(&Literal::Primitive(datum.literal.clone()), &iceberg_type) {
             Ok(value) if &value.data_type() == arrow_type => Some(value),
@@ -591,11 +955,7 @@ impl IcebergTableProvider {
 
         let mut total_rows: usize = 0;
         let mut total_bytes: usize = 0;
-
-        // Preserve the Arrow output order, which may move identity partition columns.
         let field_ids = self.arrow_field_ids();
-
-        // A table-level statistic is exact only when every file contributes a compatible value.
         let column_count = self.arrow_schema.fields().len();
         let mut min_scalars: Vec<Option<ScalarValue>> = vec![None; column_count];
         let mut max_scalars: Vec<Option<ScalarValue>> = vec![None; column_count];
@@ -701,7 +1061,6 @@ impl IcebergTableProvider {
         let num_rows = Precision::Exact(data_file.record_count() as usize);
         let total_byte_size = Precision::Exact(data_file.file_size_in_bytes() as usize);
 
-        // Create column statistics from Iceberg metadata
         let column_statistics = self
             .arrow_schema
             .fields()
@@ -716,15 +1075,11 @@ impl IcebergTableProvider {
                     .and_then(|field_id| data_file.null_value_counts().get(&field_id))
                     .map(|&count| Precision::Exact(count as usize))
                     .unwrap_or(Precision::Absent);
-
-                let distinct_count = Precision::Absent;
-
                 let min_value = field_id
                     .and_then(|field_id| data_file.lower_bounds().get(&field_id))
                     .and_then(|datum| Self::datum_to_scalar(datum, field.data_type()))
                     .map(Precision::Exact)
                     .unwrap_or(Precision::Absent);
-
                 let max_value = field_id
                     .and_then(|field_id| data_file.upper_bounds().get(&field_id))
                     .and_then(|datum| Self::datum_to_scalar(datum, field.data_type()))
@@ -735,7 +1090,7 @@ impl IcebergTableProvider {
                     null_count,
                     max_value,
                     min_value,
-                    distinct_count,
+                    distinct_count: Precision::Absent,
                     sum_value: Precision::Absent,
                     byte_size: Precision::Absent,
                 }
@@ -748,293 +1103,12 @@ impl IcebergTableProvider {
             column_statistics,
         }
     }
-
-    fn current_partition_columns(&self) -> Result<Vec<CatalogPartitionField>> {
-        let spec = self
-            .partition_specs
-            .iter()
-            .find(|spec| spec.spec_id() == self.default_spec_id)
-            .ok_or_else(|| {
-                datafusion::common::DataFusionError::Plan(format!(
-                    "Iceberg default partition spec {} was not found",
-                    self.default_spec_id
-                ))
-            })?;
-        spec.fields()
-            .iter()
-            .map(|field| {
-                let source = self.schema.field_by_id(field.source_id).ok_or_else(|| {
-                    datafusion::common::DataFusionError::Plan(format!(
-                        "Iceberg partition field '{}' references missing source field id {}",
-                        field.name, field.source_id
-                    ))
-                })?;
-                catalog_partition_field_from_iceberg(source.name.clone(), field.transform)
-                    .map_err(datafusion::common::DataFusionError::Plan)
-            })
-            .collect()
-    }
-
-    fn scan_data_files(
-        &self,
-        session: &dyn Session,
-        store_ctx: &StoreContext,
-        data_files: Vec<DataFile>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        if data_files.is_empty() {
-            return Ok(Arc::new(EmptyExec::new(self.arrow_schema.clone())));
-        }
-        let statistics = self.aggregate_statistics(&data_files);
-        let partitioned_files = self.create_partitioned_files(store_ctx, data_files)?;
-        let file_groups = self.create_file_groups(partitioned_files);
-        let parquet_source = self.build_parquet_source(session, None, &[], &[], false)?;
-        let file_scan_config = FileScanConfigBuilder::new(self.object_store_url()?, parquet_source)
-            .with_file_groups(file_groups)
-            .with_statistics(statistics)
-            .with_expr_adapter(Some(Arc::new(SchemaEvolutionPhysicalExprAdapterFactory {})
-                as Arc<dyn PhysicalExprAdapterFactory>))
-            .build();
-        Ok(DataSourceExec::from_data_source(file_scan_config))
-    }
-
-    fn retain_delete_survivors(
-        session: &dyn Session,
-        input: Arc<dyn ExecutionPlan>,
-        condition: Option<ExprWithSource>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        let Some(condition) = condition else {
-            return Ok(Arc::new(EmptyExec::new(input.schema())));
-        };
-        let schema = input.schema().to_dfschema()?;
-        let survivor_expr = Expr::IsNotTrue(Box::new(condition.expr));
-        let physical_expr = session.create_physical_expr(survivor_expr, &schema)?;
-        Ok(Arc::new(FilterExec::try_new(physical_expr, input)?))
-    }
-
-    fn align_schemas_for_union(
-        new_data: Arc<dyn ExecutionPlan>,
-        old_data: Arc<dyn ExecutionPlan>,
-    ) -> Result<(Arc<dyn ExecutionPlan>, Arc<dyn ExecutionPlan>)> {
-        let new_schema = new_data.schema();
-        let old_schema = old_data.schema();
-        if new_schema.fields().len() != old_schema.fields().len() {
-            return plan_err!(
-                "schema mismatch between new and existing Iceberg data during predicate overwrite"
-            );
-        }
-
-        let mut new_projection = Vec::with_capacity(new_schema.fields().len());
-        let mut old_projection = Vec::with_capacity(new_schema.fields().len());
-        for (new_index, new_field) in new_schema.fields().iter().enumerate() {
-            let (old_index, old_field) = old_schema
-                .fields()
-                .iter()
-                .enumerate()
-                .find(|(_, field)| field.name() == new_field.name())
-                .ok_or_else(|| {
-                    datafusion::common::DataFusionError::Plan(format!(
-                        "field '{}' is missing from existing Iceberg data during predicate overwrite",
-                        new_field.name()
-                    ))
-                })?;
-            if old_field.data_type() != new_field.data_type() {
-                return plan_err!(
-                    "field '{}' has incompatible types during predicate overwrite: new={}, existing={}",
-                    new_field.name(),
-                    new_field.data_type(),
-                    old_field.data_type()
-                );
-            }
-            new_projection.push((
-                Arc::new(Column::new(new_field.name(), new_index)) as Arc<dyn PhysicalExpr>,
-                new_field.name().clone(),
-            ));
-            old_projection.push((
-                Arc::new(Column::new(new_field.name(), old_index)) as Arc<dyn PhysicalExpr>,
-                new_field.name().clone(),
-            ));
-        }
-
-        Ok((
-            Arc::new(ProjectionExec::try_new(new_projection, new_data)?),
-            Arc::new(ProjectionExec::try_new(old_projection, old_data)?),
-        ))
-    }
-
-    pub(crate) async fn build_cow_overwrite_if_plan(
-        &self,
-        session: &dyn Session,
-        new_data: Arc<dyn ExecutionPlan>,
-        prepared_logical_input_schema: SchemaRef,
-        condition: ExprWithSource,
-        writer_options: IcebergWriterExecOptions,
-        sort_order: Option<Vec<datafusion::physical_expr::PhysicalSortExpr>>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        let table_url = Url::parse(&self.table_uri)
-            .map_err(|error| datafusion::common::DataFusionError::External(Box::new(error)))?;
-        let expected_snapshot_id = Some(self.snapshot.as_ref().map(Snapshot::snapshot_id));
-        let source = condition.source.clone();
-        let logical_input_schema = Some(prepared_logical_input_schema);
-        let (candidate_scan, removed_data_file_paths) = if self.snapshot.is_some() {
-            let object_store = get_object_store_from_session(session, &table_url)?;
-            let store_ctx = StoreContext::new(object_store, &table_url)?;
-            let manifest_list = self.load_manifest_list(&store_ctx).await?;
-            let delete_index = self
-                .build_delete_file_index(&store_ctx, &manifest_list)
-                .await?;
-            if !delete_index.is_empty() {
-                return plan_err!(
-                    "copy-on-write predicate overwrite is not supported for Iceberg tables with active delete files"
-                );
-            }
-            let filters = vec![condition.expr.clone()];
-            let candidates = self
-                .load_data_files_with_seq(session, &filters, &store_ctx, &manifest_list)
-                .await?
-                .into_iter()
-                .map(|(data_file, _)| data_file)
-                .collect::<Vec<_>>();
-            let removed_data_file_paths = candidates
-                .iter()
-                .map(|data_file| data_file.file_path.clone())
-                .collect();
-            (
-                self.scan_data_files(session, &store_ctx, candidates)?,
-                removed_data_file_paths,
-            )
-        } else {
-            (
-                Arc::new(EmptyExec::new(self.arrow_schema.clone())) as Arc<dyn ExecutionPlan>,
-                vec![],
-            )
-        };
-        let survivor_plan =
-            Self::retain_delete_survivors(session, candidate_scan, Some(condition))?;
-        let (new_data, survivor_plan) = Self::align_schemas_for_union(new_data, survivor_plan)?;
-        let rewrite_input = UnionExec::try_new(vec![new_data, survivor_plan])?;
-        let table_config = IcebergTableConfig {
-            table_url,
-            partition_columns: self.current_partition_columns()?,
-            table_exists: true,
-            options: writer_options,
-        };
-        IcebergPlanBuilder::new(
-            rewrite_input,
-            table_config,
-            PhysicalSinkMode::OverwriteIf {
-                condition: None,
-                source,
-            },
-            sort_order,
-            logical_input_schema,
-            session,
-        )
-        .with_expected_snapshot_id(expected_snapshot_id)
-        .with_rewrite_data_files(removed_data_file_paths, crate::spec::Operation::Overwrite)
-        .build()
-        .await
-    }
-
-    pub(crate) async fn build_cow_delete_plan(
-        &self,
-        session: &dyn Session,
-        condition: Option<ExprWithSource>,
-        writer_options: IcebergWriterExecOptions,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        let table_url = Url::parse(&self.table_uri)
-            .map_err(|error| datafusion::common::DataFusionError::External(Box::new(error)))?;
-        let expected_snapshot_id = Some(self.snapshot.as_ref().map(Snapshot::snapshot_id));
-        let (candidate_scan, removed_data_file_paths, candidate_row_count) = if self
-            .snapshot
-            .is_some()
-        {
-            let object_store = get_object_store_from_session(session, &table_url)?;
-            let store_ctx = StoreContext::new(object_store, &table_url)?;
-            let manifest_list = self.load_manifest_list(&store_ctx).await?;
-            let delete_index = self
-                .build_delete_file_index(&store_ctx, &manifest_list)
-                .await?;
-            if !delete_index.is_empty() {
-                return plan_err!(
-                    "copy-on-write DELETE is not supported for Iceberg tables with active delete files"
-                );
-            }
-            let filters = condition
-                .iter()
-                .map(|condition| condition.expr.clone())
-                .collect::<Vec<_>>();
-            let candidates = self
-                .load_data_files_with_seq(session, &filters, &store_ctx, &manifest_list)
-                .await?
-                .into_iter()
-                .map(|(data_file, _)| data_file)
-                .collect::<Vec<_>>();
-            let candidate_row_count = candidates.iter().try_fold(0_u64, |count, data_file| {
-                count.checked_add(data_file.record_count()).ok_or_else(|| {
-                    datafusion::common::DataFusionError::Execution(
-                        "Iceberg DELETE candidate row count overflow".to_string(),
-                    )
-                })
-            })?;
-            let removed_data_file_paths = candidates
-                .iter()
-                .map(|data_file| data_file.file_path.clone())
-                .collect();
-            (
-                self.scan_data_files(session, &store_ctx, candidates)?,
-                removed_data_file_paths,
-                candidate_row_count,
-            )
-        } else {
-            (
-                Arc::new(EmptyExec::new(self.arrow_schema.clone())) as Arc<dyn ExecutionPlan>,
-                vec![],
-                0,
-            )
-        };
-        let survivor_plan = Self::retain_delete_survivors(session, candidate_scan, condition)?;
-        let table_config = IcebergTableConfig {
-            table_url,
-            partition_columns: self.current_partition_columns()?,
-            table_exists: true,
-            options: writer_options,
-        };
-        let commit_plan = IcebergPlanBuilder::new(
-            survivor_plan,
-            table_config,
-            PhysicalSinkMode::Append,
-            None,
-            Some(self.arrow_schema.clone()),
-            session,
-        )
-        .with_expected_snapshot_id(expected_snapshot_id)
-        .with_rewrite_data_files(removed_data_file_paths, crate::spec::Operation::Delete)
-        .build()
-        .await?;
-
-        // The writer/commit plan returns the number of survivor rows rewritten.
-        // Spark DELETE must instead report affected rows. Every row in a candidate
-        // data file is either emitted as a survivor or matched by the predicate,
-        // so candidate rows minus rewritten survivors is the exact delete count,
-        // including conservative metric-pruning false positives.
-        let affected_count: Arc<dyn PhysicalExpr> = Arc::new(PhysicalBinaryExpr::new(
-            Arc::new(PhysicalLiteral::new(ScalarValue::UInt64(Some(
-                candidate_row_count,
-            )))),
-            Operator::Minus,
-            Arc::new(Column::new("count", 0)),
-        ));
-        Ok(Arc::new(ProjectionExec::try_new(
-            vec![(affected_count, "count".to_string())],
-            commit_plan,
-        )?))
-    }
 }
 
 #[async_trait]
 impl TableProvider for IcebergTableProvider {
     fn schema(&self) -> Arc<ArrowSchema> {
-        self.arrow_schema.clone()
+        self.output_schema.clone()
     }
 
     fn table_type(&self) -> TableType {
@@ -1063,6 +1137,12 @@ impl TableProvider for IcebergTableProvider {
                 self.projected_arrow_schema(projection)?,
             )));
         };
+
+        if self.file_column_name.is_some() || self.row_index_column_name.is_some() {
+            return self
+                .scan_with_merge_metadata(session, projection, filters, limit)
+                .await;
+        }
 
         if self.metadata_as_data_read {
             return self
@@ -1178,8 +1258,7 @@ impl TableProvider for IcebergTableProvider {
                 .with_statistics(table_stats)
                 .with_projection_indices(expanded_projection)?
                 .with_limit(limit)
-                .with_expr_adapter(Some(Arc::new(SchemaEvolutionPhysicalExprAdapterFactory {})
-                    as Arc<dyn PhysicalExprAdapterFactory>))
+                .with_expr_adapter(Some(iceberg_schema_evolution_adapter()))
                 .build();
             return Ok(DataSourceExec::from_data_source(file_scan_config));
         }
@@ -1207,8 +1286,7 @@ impl TableProvider for IcebergTableProvider {
             let file_scan_config =
                 FileScanConfigBuilder::new(object_store_url.clone(), parquet_source)
                     .with_file_groups(file_groups)
-                    .with_expr_adapter(Some(Arc::new(SchemaEvolutionPhysicalExprAdapterFactory {})
-                        as Arc<dyn PhysicalExprAdapterFactory>))
+                    .with_expr_adapter(Some(iceberg_schema_evolution_adapter()))
                     .build();
             branches.push(DataSourceExec::from_data_source(file_scan_config));
         }
@@ -1221,8 +1299,10 @@ impl TableProvider for IcebergTableProvider {
             let file_scan_config =
                 FileScanConfigBuilder::new(object_store_url.clone(), parquet_source)
                     .with_file_groups(vec![FileGroup::from(partitioned)])
-                    .with_expr_adapter(Some(Arc::new(SchemaEvolutionPhysicalExprAdapterFactory {})
-                        as Arc<dyn PhysicalExprAdapterFactory>))
+                    // Position deletes require the original file order and absolute offsets.
+                    .with_partitioned_by_file_group(true)
+                    .with_preserve_order(true)
+                    .with_expr_adapter(Some(iceberg_schema_evolution_adapter()))
                     .build();
             let data_scan: Arc<dyn ExecutionPlan> =
                 DataSourceExec::from_data_source(file_scan_config);
@@ -1296,7 +1376,10 @@ impl TableProvider for IcebergTableProvider {
         &self,
         filter: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>> {
-        if self.metadata_as_data_read {
+        if self.metadata_as_data_read
+            || self.file_column_name.is_some()
+            || self.row_index_column_name.is_some()
+        {
             return Ok(vec![TableProviderFilterPushDown::Unsupported; filter.len()]);
         }
         Ok(filter
@@ -1307,6 +1390,203 @@ impl TableProvider for IcebergTableProvider {
 }
 
 impl IcebergTableProvider {
+    async fn scan_with_merge_metadata(
+        &self,
+        session: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        log::trace!("Starting merge-metadata scan for table: {}", self.table_uri);
+
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return Ok(Arc::new(EmptyExec::new(
+                self.projected_arrow_schema(projection)?,
+            )));
+        };
+
+        let table_url = Url::parse(&self.table_uri)
+            .map_err(|e| datafusion::common::DataFusionError::External(Box::new(e)))?;
+        let base_store = get_object_store_from_session(session, &table_url)?;
+        let store_ctx = StoreContext::new(base_store.clone(), &table_url)?;
+
+        let manifest_list = self.load_manifest_list(&store_ctx).await?;
+        let (pruning_filters, parquet_pushdown_filters) = self.separate_filters(filters);
+        let mut data_files_with_seq = self
+            .load_data_files_with_seq(session, &pruning_filters, &store_ctx, &manifest_list)
+            .await?;
+
+        let filter_expr = conjunction(pruning_filters.iter().cloned());
+        if filter_expr.is_some() || limit.is_some() {
+            let (files_only, seqs_only): (Vec<DataFile>, Vec<i64>) =
+                data_files_with_seq.iter().cloned().unzip();
+            let seq_by_path: HashMap<String, i64> = files_only
+                .iter()
+                .map(|f| f.file_path.clone())
+                .zip(seqs_only)
+                .collect();
+            let (kept, _mask) = prune_files(
+                session,
+                &pruning_filters,
+                limit,
+                self.rebuild_logical_schema_for_filters(None, filters),
+                files_only,
+                &self.schema,
+            )?;
+            data_files_with_seq = kept
+                .into_iter()
+                .map(|df| {
+                    let seq = seq_by_path.get(&df.file_path).copied().unwrap_or(0);
+                    (df, seq)
+                })
+                .collect();
+        }
+
+        if data_files_with_seq.is_empty() {
+            return Ok(Arc::new(EmptyExec::new(
+                self.projected_arrow_schema(projection)?,
+            )));
+        }
+
+        let delete_index = self
+            .build_delete_file_index(&store_ctx, &manifest_list)
+            .await?;
+        let object_store_url = self.object_store_url()?;
+        let file_column_name = self.file_column_name.as_ref().ok_or_else(|| {
+            datafusion::common::DataFusionError::Internal(
+                "Iceberg merge metadata scan requires a file column".to_string(),
+            )
+        })?;
+        let mut clean_files = Vec::new();
+        let mut dirty_units = Vec::new();
+
+        for (data_file, sequence_number) in data_files_with_seq {
+            let matched = delete_index.for_data_file(&data_file, sequence_number);
+            if matched.is_empty() {
+                clean_files.push(data_file);
+            } else {
+                dirty_units.push((data_file, matched.positional, matched.equality));
+            }
+        }
+
+        let mut branches: Vec<Arc<dyn ExecutionPlan>> =
+            Vec::with_capacity(dirty_units.len() + usize::from(!clean_files.is_empty()));
+
+        if !clean_files.is_empty() {
+            let partitioned_files = self.create_merge_partitioned_files(&store_ctx, clean_files)?;
+            let file_groups = partitioned_files
+                .into_iter()
+                .map(|file| FileGroup::from(vec![file]))
+                .collect::<Vec<_>>();
+            let parquet_source =
+                self.build_merge_parquet_source(session, file_column_name.as_str());
+            let file_scan_config =
+                FileScanConfigBuilder::new(object_store_url.clone(), parquet_source)
+                    .with_file_groups(file_groups)
+                    // MERGE synthesizes file-local row positions before applying filters.
+                    // Keep every file group whole so DataFusion cannot split a Parquet file
+                    // into byte ranges whose streams would each start at position zero.
+                    .with_partitioned_by_file_group(true)
+                    .with_preserve_order(true)
+                    .with_expr_adapter(Some(iceberg_schema_evolution_adapter()))
+                    .build();
+            let data_scan = DataSourceExec::from_data_source(file_scan_config);
+            branches.push(Arc::new(
+                IcebergMergeMetadataExec::try_new_partitioned_files(
+                    data_scan,
+                    file_column_name.clone(),
+                    self.row_index_column_name.clone(),
+                )?,
+            ));
+        }
+
+        for (df, positional_deletes, equality_deletes) in dirty_units {
+            let partitioned = self.create_partitioned_files(&store_ctx, vec![df.clone()])?;
+            let parquet_source = self.build_parquet_source(session, None, &[], &[], false)?;
+            let file_scan_config =
+                FileScanConfigBuilder::new(object_store_url.clone(), parquet_source)
+                    .with_file_groups(vec![FileGroup::from(partitioned)])
+                    // Existing position deletes and MERGE row positions both require the
+                    // original file order and absolute offsets.
+                    .with_partitioned_by_file_group(true)
+                    .with_preserve_order(true)
+                    .with_expr_adapter(Some(iceberg_schema_evolution_adapter()))
+                    .build();
+            let data_scan: Arc<dyn ExecutionPlan> =
+                DataSourceExec::from_data_source(file_scan_config);
+            let with_metadata: Arc<dyn ExecutionPlan> =
+                Arc::new(IcebergMergeMetadataExec::try_new(
+                    data_scan,
+                    df.file_path.clone(),
+                    df.partition_spec_id,
+                    serde_json::to_string(&df.partition).map_err(|error| {
+                        datafusion::common::DataFusionError::External(Box::new(error))
+                    })?,
+                    self.file_column_name.clone(),
+                    self.row_index_column_name.clone(),
+                )?);
+
+            branches.push(Arc::new(IcebergDeleteApplyExec::new(
+                with_metadata,
+                df.file_path.clone(),
+                positional_deletes,
+                equality_deletes,
+                self.table_uri.clone(),
+                self.schema.clone(),
+            )));
+        }
+
+        let unioned: Arc<dyn ExecutionPlan> = if branches.len() == 1 {
+            branches.into_iter().next().ok_or_else(|| {
+                datafusion::common::DataFusionError::Internal(
+                    "unreachable: branches.len() == 1 but next() returned None".to_string(),
+                )
+            })?
+        } else {
+            UnionExec::try_new(branches)?
+        };
+
+        let after_filter: Arc<dyn ExecutionPlan> = if !parquet_pushdown_filters.is_empty() {
+            let df_schema = self.output_schema.clone().to_dfschema()?;
+            let pushdown_expr = conjunction(parquet_pushdown_filters.clone()).ok_or_else(|| {
+                datafusion::common::DataFusionError::Internal(
+                    "conjunction over non-empty filters returned None".to_string(),
+                )
+            })?;
+            let simplified = simplify_expr(session, &df_schema, pushdown_expr)?;
+            Arc::new(FilterExec::try_new(simplified, unioned)?)
+        } else {
+            unioned
+        };
+
+        let after_projection: Arc<dyn ExecutionPlan> = if let Some(proj) = projection {
+            let projected_schema = self.output_schema.clone();
+            let proj_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> = proj
+                .iter()
+                .map(|&idx| {
+                    let field = projected_schema.field(idx);
+                    let col: Arc<dyn PhysicalExpr> = Arc::new(Column::new(field.name(), idx));
+                    (col, field.name().to_string())
+                })
+                .collect();
+            Arc::new(ProjectionExec::try_new(proj_exprs, after_filter)?)
+        } else {
+            after_filter
+        };
+
+        let final_plan: Arc<dyn ExecutionPlan> = if let Some(lim) = limit {
+            Arc::new(GlobalLimitExec::new(after_projection, 0, Some(lim)))
+        } else {
+            after_projection
+        };
+
+        log::trace!(
+            "Built merge-metadata scan for snapshot {}",
+            snapshot.snapshot_id()
+        );
+        Ok(final_plan)
+    }
+
     fn classify_pushdown_for_expr(&self, expr: &Expr) -> TableProviderFilterPushDown {
         use TableProviderFilterPushDown as FP;
         // Identity partition columns can satisfy Eq/IN at partition level. Transformed
@@ -1568,279 +1848,48 @@ impl IcebergTableProvider {
 
 #[cfg(test)]
 mod tests {
-    use bytes::Bytes;
-    use datafusion::arrow::array::{BooleanArray, Int64Array};
-    use datafusion::arrow::datatypes::{DataType, Field};
-    use datafusion::arrow::record_batch::RecordBatch;
-    use datafusion::datasource::memory::MemorySourceConfig;
-    use datafusion::prelude::SessionContext;
-    use object_store::ObjectStoreExt;
-    use object_store::memory::InMemory;
-    use sail_common_datafusion::logical_expr::ExprWithSource;
-
     use super::*;
-    use crate::physical_plan::IcebergWriterExec;
-    use crate::physical_plan::commit::commit_exec::IcebergCommitExec;
-    use crate::spec::manifest::{DataContentType, DataFileFormat, ManifestWriterBuilder};
-    use crate::spec::types::{NestedField, PrimitiveType, Type};
-    use crate::spec::{FormatVersion, ManifestListWriter, SnapshotBuilder};
+    use crate::spec::manifest::{DataContentType, DataFileFormat};
+    use crate::spec::types::values::PrimitiveLiteral;
+    use crate::spec::types::{NestedField, PrimitiveType};
 
-    fn find_writer(plan: &Arc<dyn ExecutionPlan>) -> Option<&IcebergWriterExec> {
-        if let Some(writer) = plan.downcast_ref::<IcebergWriterExec>() {
-            return Some(writer);
-        }
-        plan.children().into_iter().find_map(find_writer)
-    }
-
-    fn test_schema() -> Result<Schema> {
-        Schema::builder()
-            .with_schema_id(0)
-            .with_fields(vec![Arc::new(NestedField::required(
-                1,
-                "id",
-                Type::Primitive(PrimitiveType::Long),
-            ))])
-            .build()
-            .map_err(datafusion::common::DataFusionError::Execution)
-    }
-
-    fn test_int_schema() -> Result<Schema> {
+    fn schema(field_type: PrimitiveType) -> Result<Schema> {
         Schema::builder()
             .with_schema_id(0)
             .with_fields(vec![Arc::new(NestedField::optional(
                 1,
-                "id",
-                Type::Primitive(PrimitiveType::Int),
+                "value",
+                Type::Primitive(field_type),
             ))])
             .build()
             .map_err(datafusion::common::DataFusionError::Execution)
     }
 
-    fn partitioned_statistics_schema() -> Result<Schema> {
-        Schema::builder()
-            .with_schema_id(0)
-            .with_fields(vec![
-                Arc::new(NestedField::required(
-                    1,
-                    "id",
-                    Type::Primitive(PrimitiveType::Long),
-                )),
-                Arc::new(NestedField::required(
-                    2,
-                    "category",
-                    Type::Primitive(PrimitiveType::String),
-                )),
-                Arc::new(NestedField::required(
-                    3,
-                    "value",
-                    Type::Primitive(PrimitiveType::Long),
-                )),
-            ])
-            .build()
-            .map_err(datafusion::common::DataFusionError::Execution)
-    }
-
-    fn partitioned_statistics_data_file() -> DataFile {
-        use crate::spec::types::values::PrimitiveLiteral;
-
-        let mut data_file = bounded_int_data_file("data/category=C/part.parquet", 7, 7);
-        data_file.partition = vec![Some(Literal::Primitive(PrimitiveLiteral::String(
-            "C".to_string(),
-        )))];
-        data_file.record_count = 1;
-        data_file.value_counts = HashMap::from([(1, 1), (2, 1), (3, 1)]);
-        data_file.null_value_counts = HashMap::from([(1, 0), (2, 0), (3, 0)]);
-        let bounds = HashMap::from([
-            (
-                1,
-                crate::spec::Datum::new(PrimitiveType::Long, PrimitiveLiteral::Long(7)),
-            ),
-            (
-                2,
-                crate::spec::Datum::new(
-                    PrimitiveType::String,
-                    PrimitiveLiteral::String("C".to_string()),
-                ),
-            ),
-            (
-                3,
-                crate::spec::Datum::new(PrimitiveType::Long, PrimitiveLiteral::Long(300)),
-            ),
-        ]);
-        data_file.lower_bounds = bounds.clone();
-        data_file.upper_bounds = bounds;
-        data_file
-    }
-
-    #[test]
-    fn statistics_follow_reordered_arrow_schema() -> Result<()> {
-        let partition_spec = PartitionSpec::builder()
-            .with_spec_id(0)
-            .add_field(2, "category", Transform::Identity)
-            .build();
-        let provider = IcebergTableProvider::new_empty(
-            "file:///tmp/iceberg-reordered-statistics",
-            partitioned_statistics_schema()?,
-            vec![partition_spec],
-            0,
-        )?;
-        let data_file = partitioned_statistics_data_file();
-
-        let names: Vec<&str> = provider
-            .arrow_schema
-            .fields()
-            .iter()
-            .map(|field| field.name().as_str())
-            .collect();
-        assert_eq!(names, vec!["id", "value", "category"]);
-
-        for statistics in [
-            provider.create_file_statistics(&data_file),
-            provider.aggregate_statistics(std::slice::from_ref(&data_file)),
-        ] {
-            assert_eq!(
-                statistics.column_statistics[1].min_value,
-                Precision::Exact(ScalarValue::Int64(Some(300)))
-            );
-            assert_eq!(
-                statistics.column_statistics[2].min_value,
-                Precision::Exact(ScalarValue::Utf8(Some("C".to_string())))
-            );
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn statistics_drop_bounds_that_do_not_match_current_arrow_type() -> Result<()> {
-        let provider = IcebergTableProvider::new_empty(
-            "file:///tmp/iceberg-promoted-statistics",
-            test_schema()?,
-            vec![PartitionSpec::unpartitioned_spec()],
-            0,
-        )?;
-        let historical = bounded_int_data_file("data/historical-int.parquet", 1, 3);
-        let mut current = bounded_int_data_file("data/current-long.parquet", 0, 0);
-        current.lower_bounds = HashMap::from([(
-            1,
-            crate::spec::Datum::new(
-                PrimitiveType::Long,
-                crate::spec::types::values::PrimitiveLiteral::Long(4),
-            ),
-        )]);
-        current.upper_bounds = HashMap::from([(
-            1,
-            crate::spec::Datum::new(
-                PrimitiveType::Long,
-                crate::spec::types::values::PrimitiveLiteral::Long(6),
-            ),
-        )]);
-
-        let file_statistics = provider.create_file_statistics(&historical);
-        assert_eq!(
-            file_statistics.column_statistics[0].min_value,
-            Precision::Absent
-        );
-        assert_eq!(
-            file_statistics.column_statistics[0].max_value,
-            Precision::Absent
-        );
-        let aggregate = provider.aggregate_statistics(&[historical, current]);
-        assert_eq!(aggregate.column_statistics[0].min_value, Precision::Absent);
-        assert_eq!(aggregate.column_statistics[0].max_value, Precision::Absent);
-        Ok(())
-    }
-
-    #[test]
-    fn aggregate_statistics_are_absent_when_any_file_metric_is_missing() -> Result<()> {
-        let provider = IcebergTableProvider::new_empty(
-            "file:///tmp/iceberg-incomplete-statistics",
-            test_int_schema()?,
-            vec![PartitionSpec::unpartitioned_spec()],
-            0,
-        )?;
-        let known = bounded_int_data_file("data/known.parquet", 1, 3);
-        let mut unknown = bounded_int_data_file("data/unknown.parquet", 4, 6);
-        unknown.lower_bounds.clear();
-        unknown.upper_bounds.clear();
-        unknown.null_value_counts.clear();
-
-        let aggregate = provider.aggregate_statistics(&[known, unknown]);
-
-        assert_eq!(aggregate.column_statistics[0].min_value, Precision::Absent);
-        assert_eq!(aggregate.column_statistics[0].max_value, Precision::Absent);
-        assert_eq!(aggregate.column_statistics[0].null_count, Precision::Absent);
-        Ok(())
-    }
-
-    #[test]
-    fn aggregate_statistics_preserve_date_scalar_type() -> Result<()> {
-        let schema = Schema::builder()
-            .with_schema_id(0)
-            .with_fields(vec![Arc::new(NestedField::optional(
-                1,
-                "event_date",
-                Type::Primitive(PrimitiveType::Date),
-            ))])
-            .build()
-            .map_err(datafusion::common::DataFusionError::Execution)?;
-        let provider = IcebergTableProvider::new_empty(
-            "file:///tmp/iceberg-date-statistics",
-            schema,
-            vec![PartitionSpec::unpartitioned_spec()],
-            0,
-        )?;
-        let date_bound = |value| {
-            crate::spec::Datum::new(
-                PrimitiveType::Date,
-                crate::spec::types::values::PrimitiveLiteral::Int(value),
-            )
-        };
-        let mut data_file = bounded_int_data_file("data/date.parquet", 0, 0);
-        data_file.lower_bounds = HashMap::from([(1, date_bound(19_723))]);
-        data_file.upper_bounds = HashMap::from([(1, date_bound(19_725))]);
-
-        for statistics in [
-            provider.create_file_statistics(&data_file),
-            provider.aggregate_statistics(&[data_file]),
-        ] {
-            assert_eq!(
-                statistics.column_statistics[0].min_value,
-                Precision::Exact(ScalarValue::Date32(Some(19_723)))
-            );
-            assert_eq!(
-                statistics.column_statistics[0].max_value,
-                Precision::Exact(ScalarValue::Date32(Some(19_725)))
-            );
-        }
-        Ok(())
-    }
-
-    fn bounded_int_data_file(path: &str, lower: i32, upper: i32) -> DataFile {
+    fn data_file(
+        path: &str,
+        lower: Option<Datum>,
+        upper: Option<Datum>,
+        null_count: Option<u64>,
+    ) -> DataFile {
         DataFile {
             content: DataContentType::Data,
             file_path: path.to_string(),
             file_format: DataFileFormat::Parquet,
             partition: vec![],
-            record_count: 3,
+            record_count: 2,
             file_size_in_bytes: 100,
             column_sizes: HashMap::new(),
-            value_counts: HashMap::from([(1, 3)]),
-            null_value_counts: HashMap::from([(1, 0)]),
+            value_counts: HashMap::new(),
+            null_value_counts: null_count
+                .map(|count| HashMap::from([(1, count)]))
+                .unwrap_or_default(),
             nan_value_counts: HashMap::new(),
-            lower_bounds: HashMap::from([(
-                1,
-                crate::spec::Datum::new(
-                    PrimitiveType::Int,
-                    crate::spec::types::values::PrimitiveLiteral::Int(lower),
-                ),
-            )]),
-            upper_bounds: HashMap::from([(
-                1,
-                crate::spec::Datum::new(
-                    PrimitiveType::Int,
-                    crate::spec::types::values::PrimitiveLiteral::Int(upper),
-                ),
-            )]),
+            lower_bounds: lower
+                .map(|datum| HashMap::from([(1, datum)]))
+                .unwrap_or_default(),
+            upper_bounds: upper
+                .map(|datum| HashMap::from([(1, datum)]))
+                .unwrap_or_default(),
             block_size_in_bytes: None,
             key_metadata: None,
             split_offsets: vec![],
@@ -1854,408 +1903,75 @@ mod tests {
         }
     }
 
-    fn positional_delete_file(path: &str) -> DataFile {
-        DataFile {
-            content: DataContentType::PositionDeletes,
-            file_path: path.to_string(),
-            file_format: DataFileFormat::Parquet,
-            partition: vec![],
-            record_count: 1,
-            file_size_in_bytes: 100,
-            column_sizes: HashMap::new(),
-            value_counts: HashMap::new(),
-            null_value_counts: HashMap::new(),
-            nan_value_counts: HashMap::new(),
-            lower_bounds: HashMap::new(),
-            upper_bounds: HashMap::new(),
-            block_size_in_bytes: None,
-            key_metadata: None,
-            split_offsets: vec![],
-            equality_ids: vec![],
-            sort_order_id: None,
-            first_row_id: None,
-            partition_spec_id: 0,
-            referenced_data_file: Some("data/target.parquet".to_string()),
-            content_offset: None,
-            content_size_in_bytes: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn cow_delete_rejects_active_delete_files() -> Result<()> {
-        let table_url = Url::parse("memory://delete-files/table")
-            .map_err(|error| datafusion::common::DataFusionError::Plan(error.to_string()))?;
-        let object_store = Arc::new(InMemory::new());
-        let store_ctx = StoreContext::new(object_store.clone(), &table_url)?;
-        let schema = test_schema()?;
-        let partition_spec = PartitionSpec::unpartitioned_spec();
-        let manifest_metadata = crate::spec::manifest::ManifestMetadata::new(
-            Arc::new(schema.clone()),
-            schema.schema_id(),
-            partition_spec.clone(),
-            FormatVersion::V2,
-            ManifestContentType::Deletes,
-        );
-        let snapshot_id = 7;
-        let sequence_number = 1;
-        let mut manifest_writer =
-            ManifestWriterBuilder::new(Some(snapshot_id), None, manifest_metadata).build();
-        manifest_writer.add(positional_delete_file("data/delete.parquet"));
-        let manifest_bytes = manifest_writer
-            .to_avro_bytes_v2()
-            .map_err(|error| datafusion::common::DataFusionError::Execution(error.to_string()))?;
-        let mut manifest_file = manifest_writer.into_manifest_file(
-            "metadata/delete-manifest.avro".to_string(),
-            sequence_number,
-            snapshot_id,
-        );
-        manifest_file.manifest_length = manifest_bytes.len() as i64;
-        store_ctx
-            .prefixed
-            .put(
-                &object_store::path::Path::from("metadata/delete-manifest.avro"),
-                object_store::PutPayload::from(Bytes::from(manifest_bytes)),
-            )
-            .await
-            .map_err(|error| datafusion::common::DataFusionError::External(Box::new(error)))?;
-        let mut manifest_list_writer = ManifestListWriter::new();
-        manifest_list_writer.append(manifest_file);
-        let manifest_list_bytes = manifest_list_writer
-            .to_bytes(FormatVersion::V2)
-            .map_err(datafusion::common::DataFusionError::Execution)?;
-        store_ctx
-            .prefixed
-            .put(
-                &object_store::path::Path::from("metadata/snap-delete.avro"),
-                object_store::PutPayload::from(Bytes::from(manifest_list_bytes)),
-            )
-            .await
-            .map_err(|error| datafusion::common::DataFusionError::External(Box::new(error)))?;
-        let snapshot = SnapshotBuilder::new()
-            .with_snapshot_id(snapshot_id)
-            .with_sequence_number(sequence_number)
-            .with_manifest_list("metadata/snap-delete.avro")
-            .with_summary(crate::spec::snapshots::Summary::new(
-                crate::spec::Operation::Delete,
-            ))
-            .with_schema_id(schema.schema_id())
-            .build()
-            .map_err(datafusion::common::DataFusionError::Execution)?;
-        let provider = IcebergTableProvider::new(
-            table_url.clone(),
-            schema,
-            snapshot,
-            vec![partition_spec],
-            0,
-        )?;
-        let context = SessionContext::new();
-        context.runtime_env().register_object_store(
-            &Url::parse("memory://delete-files")
-                .map_err(|error| datafusion::common::DataFusionError::Plan(error.to_string()))?,
-            object_store,
-        );
-
-        let error = provider
-            .build_cow_delete_plan(&context.state(), None, IcebergWriterExecOptions::default())
-            .await
-            .err()
-            .ok_or_else(|| {
-                datafusion::common::DataFusionError::Internal(
-                    "active delete files must fail closed".to_string(),
-                )
-            })?;
-        assert!(error.to_string().contains("active delete files"));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn cow_delete_prunes_non_matching_bounded_manifest_file() -> Result<()> {
-        let table_url = Url::parse("memory://bounded-delete/table")
-            .map_err(|error| datafusion::common::DataFusionError::Plan(error.to_string()))?;
-        let object_store = Arc::new(InMemory::new());
-        let store_ctx = StoreContext::new(object_store.clone(), &table_url)?;
-        let schema = test_int_schema()?;
-        let partition_spec = PartitionSpec::unpartitioned_spec();
-        let manifest_metadata = crate::spec::manifest::ManifestMetadata::new(
-            Arc::new(schema.clone()),
-            schema.schema_id(),
-            partition_spec.clone(),
-            FormatVersion::V2,
-            ManifestContentType::Data,
-        );
-        let snapshot_id = 7;
-        let sequence_number = 1;
-        let mut manifest_writer =
-            ManifestWriterBuilder::new(Some(snapshot_id), None, manifest_metadata).build();
-        manifest_writer.add(bounded_int_data_file("data/target.parquet", 1, 3));
-        let manifest_bytes = manifest_writer
-            .to_avro_bytes_v2()
-            .map_err(datafusion::common::DataFusionError::Execution)?;
-        let mut manifest_file = manifest_writer.into_manifest_file(
-            "metadata/data-manifest.avro".to_string(),
-            sequence_number,
-            snapshot_id,
-        );
-        manifest_file.manifest_length = manifest_bytes.len() as i64;
-        store_ctx
-            .prefixed
-            .put(
-                &object_store::path::Path::from("metadata/data-manifest.avro"),
-                object_store::PutPayload::from(Bytes::from(manifest_bytes)),
-            )
-            .await
-            .map_err(|error| datafusion::common::DataFusionError::External(Box::new(error)))?;
-        let decoded_manifest = io_load_manifest(&store_ctx, "metadata/data-manifest.avro").await?;
-        let decoded_file = &decoded_manifest.entries()[0].data_file;
-        assert_eq!(
-            decoded_file.lower_bounds.get(&1),
-            Some(&crate::spec::Datum::new(
-                PrimitiveType::Int,
-                crate::spec::types::values::PrimitiveLiteral::Int(1),
-            ))
-        );
-        assert_eq!(
-            decoded_file.upper_bounds.get(&1),
-            Some(&crate::spec::Datum::new(
-                PrimitiveType::Int,
-                crate::spec::types::values::PrimitiveLiteral::Int(3),
-            ))
-        );
-        let mut manifest_list_writer = ManifestListWriter::new();
-        manifest_list_writer.append(manifest_file);
-        let manifest_list_bytes = manifest_list_writer
-            .to_bytes(FormatVersion::V2)
-            .map_err(datafusion::common::DataFusionError::Execution)?;
-        store_ctx
-            .prefixed
-            .put(
-                &object_store::path::Path::from("metadata/snap-data.avro"),
-                object_store::PutPayload::from(Bytes::from(manifest_list_bytes)),
-            )
-            .await
-            .map_err(|error| datafusion::common::DataFusionError::External(Box::new(error)))?;
-        let snapshot = SnapshotBuilder::new()
-            .with_snapshot_id(snapshot_id)
-            .with_sequence_number(sequence_number)
-            .with_manifest_list("metadata/snap-data.avro")
-            .with_summary(crate::spec::snapshots::Summary::new(
-                crate::spec::Operation::Append,
-            ))
-            .with_schema_id(schema.schema_id())
-            .build()
-            .map_err(datafusion::common::DataFusionError::Execution)?;
-        let provider = IcebergTableProvider::new(
-            table_url.clone(),
-            schema,
-            snapshot,
-            vec![partition_spec],
-            0,
-        )?;
-        let context = SessionContext::new();
-        context.runtime_env().register_object_store(
-            &Url::parse("memory://bounded-delete")
-                .map_err(|error| datafusion::common::DataFusionError::Plan(error.to_string()))?,
-            object_store,
-        );
-        let condition = ExprWithSource::new(
-            datafusion_expr::col("id").eq(datafusion_expr::lit(999_i32)),
-            Some("id = 999".to_string()),
-        );
-        let loaded_manifest_list = provider.load_manifest_list(&store_ctx).await?;
-        let candidates = provider
-            .load_data_files_with_seq(
-                &context.state(),
-                std::slice::from_ref(&condition.expr),
-                &store_ctx,
-                &loaded_manifest_list,
-            )
-            .await?;
-        assert!(candidates.is_empty());
-
-        let plan = provider
-            .build_cow_delete_plan(
-                &context.state(),
-                Some(condition),
-                IcebergWriterExecOptions::default(),
-            )
-            .await?;
-        let projection = plan.downcast_ref::<ProjectionExec>().ok_or_else(|| {
-            datafusion::common::DataFusionError::Internal(
-                "delete plan root must project the affected row count".to_string(),
-            )
-        })?;
-        let commit = projection
-            .input()
-            .downcast_ref::<IcebergCommitExec>()
-            .ok_or_else(|| {
-                datafusion::common::DataFusionError::Internal(
-                    "delete count projection input must be IcebergCommitExec".to_string(),
-                )
-            })?;
-
-        assert!(commit.removed_data_file_paths().is_empty());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn empty_table_delete_plan_preserves_strict_empty_snapshot_validation() -> Result<()> {
+    #[test]
+    fn statistics_preserve_date_scalar_type() -> Result<()> {
         let provider = IcebergTableProvider::new_empty(
-            "file:///tmp/iceberg-empty-delete",
-            test_schema()?,
+            "file:///tmp/iceberg-date-statistics",
+            schema(PrimitiveType::Date)?,
             vec![PartitionSpec::unpartitioned_spec()],
             0,
         )?;
-        let context = SessionContext::new();
-        let plan = provider
-            .build_cow_delete_plan(&context.state(), None, IcebergWriterExecOptions::default())
-            .await?;
-        let projection = plan.downcast_ref::<ProjectionExec>().ok_or_else(|| {
-            datafusion::common::DataFusionError::Internal(
-                "delete plan root must project the affected row count".to_string(),
-            )
-        })?;
-        let commit = projection
-            .input()
-            .downcast_ref::<IcebergCommitExec>()
-            .ok_or_else(|| {
-                datafusion::common::DataFusionError::Internal(
-                    "delete count projection input must be IcebergCommitExec".to_string(),
-                )
-            })?;
-
-        assert_eq!(commit.expected_snapshot_id(), Some(None));
-        assert_eq!(
-            commit.operation_override(),
-            Some(&crate::spec::Operation::Delete)
+        let date_bound = |value| Datum::new(PrimitiveType::Date, PrimitiveLiteral::Int(value));
+        let file = data_file(
+            "data/date.parquet",
+            Some(date_bound(19_723)),
+            Some(date_bound(19_725)),
+            Some(0),
         );
-        assert!(commit.removed_data_file_paths().is_empty());
+
+        for statistics in [
+            provider.create_file_statistics(&file),
+            provider.aggregate_statistics(&[file]),
+        ] {
+            assert_eq!(
+                statistics.column_statistics[0].min_value,
+                Precision::Exact(ScalarValue::Date32(Some(19_723)))
+            );
+            assert_eq!(
+                statistics.column_statistics[0].max_value,
+                Precision::Exact(ScalarValue::Date32(Some(19_725)))
+            );
+        }
         Ok(())
     }
 
-    #[tokio::test]
-    async fn empty_table_overwrite_if_plan_preserves_strict_snapshot_validation() -> Result<()> {
+    #[test]
+    fn statistics_drop_incomplete_or_incompatible_metrics() -> Result<()> {
         let provider = IcebergTableProvider::new_empty(
-            "file:///tmp/iceberg-empty-overwrite-if",
-            test_schema()?,
+            "file:///tmp/iceberg-incomplete-statistics",
+            schema(PrimitiveType::Long)?,
             vec![PartitionSpec::unpartitioned_spec()],
             0,
         )?;
-        let physical_input_schema = Arc::new(ArrowSchema::new(vec![Field::new(
-            "id",
-            DataType::Int64,
-            false,
-        )]));
-        let logical_input_schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("id", DataType::Int64, false).with_metadata(HashMap::from([(
-                "iceberg.test.metadata".to_string(),
-                "preserved".to_string(),
-            )])),
-        ]));
-        let input_batch = RecordBatch::try_new(
-            physical_input_schema.clone(),
-            vec![Arc::new(Int64Array::from(Vec::<i64>::new()))],
-        )?;
-        let input: Arc<dyn ExecutionPlan> =
-            MemorySourceConfig::try_new_from_batches(physical_input_schema, vec![input_batch])?;
-        let context = SessionContext::new();
-        let condition = ExprWithSource::new(
-            datafusion_expr::col("id").eq(datafusion_expr::lit(7_i64)),
-            Some("id = 7".to_string()),
+        let int_bound = |value| Datum::new(PrimitiveType::Int, PrimitiveLiteral::Int(value));
+        let long_bound = |value| Datum::new(PrimitiveType::Long, PrimitiveLiteral::Long(value));
+        let incompatible = data_file(
+            "data/historical-int.parquet",
+            Some(int_bound(1)),
+            Some(int_bound(3)),
+            Some(0),
+        );
+        let incomplete = data_file(
+            "data/current-long.parquet",
+            Some(long_bound(4)),
+            Some(long_bound(6)),
+            None,
         );
 
-        let plan = provider
-            .build_cow_overwrite_if_plan(
-                &context.state(),
-                input,
-                logical_input_schema.clone(),
-                condition,
-                IcebergWriterExecOptions::default(),
-                None,
-            )
-            .await?;
-        let commit = plan.downcast_ref::<IcebergCommitExec>().ok_or_else(|| {
-            datafusion::common::DataFusionError::Internal(
-                "overwrite-if plan root must be IcebergCommitExec".to_string(),
-            )
-        })?;
-
-        assert_eq!(commit.expected_snapshot_id(), Some(None));
+        let file_statistics = provider.create_file_statistics(&incompatible);
         assert_eq!(
-            commit.operation_override(),
-            Some(&crate::spec::Operation::Overwrite)
+            file_statistics.column_statistics[0].min_value,
+            Precision::Absent
         );
-        assert!(commit.removed_data_file_paths().is_empty());
-        let writer = find_writer(&plan).ok_or_else(|| {
-            datafusion::common::DataFusionError::Internal(
-                "overwrite-if plan must contain IcebergWriterExec".to_string(),
-            )
-        })?;
-        assert_eq!(writer.logical_input_schema(), Some(&logical_input_schema));
-        Ok(())
-    }
+        assert_eq!(
+            file_statistics.column_statistics[0].max_value,
+            Precision::Absent
+        );
 
-    #[tokio::test]
-    async fn delete_survivors_retain_false_and_null_predicate_rows() -> Result<()> {
-        let schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("matches", DataType::Boolean, true),
-            Field::new("id", DataType::Int64, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(BooleanArray::from(vec![Some(true), Some(false), None])),
-                Arc::new(Int64Array::from(vec![1, 2, 3])),
-            ],
-        )?;
-        let input: Arc<dyn ExecutionPlan> =
-            MemorySourceConfig::try_new_from_batches(schema, vec![batch])?;
-        let context = SessionContext::new();
-        let survivors = IcebergTableProvider::retain_delete_survivors(
-            &context.state(),
-            input,
-            Some(ExprWithSource::new(
-                datafusion_expr::col("matches"),
-                Some("matches".to_string()),
-            )),
-        )?;
-
-        let batches = datafusion::physical_plan::collect(survivors, context.task_ctx()).await?;
-        let mut ids = Vec::new();
-        for batch in &batches {
-            let array = batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| {
-                    datafusion::common::DataFusionError::Internal(
-                        "id column must remain Int64".to_string(),
-                    )
-                })?;
-            ids.extend(array.values().iter().copied());
-        }
-        assert_eq!(ids, vec![2, 3]);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn conditionless_delete_retains_no_rows() -> Result<()> {
-        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
-            "id",
-            DataType::Int64,
-            false,
-        )]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
-        )?;
-        let input: Arc<dyn ExecutionPlan> =
-            MemorySourceConfig::try_new_from_batches(schema, vec![batch])?;
-        let context = SessionContext::new();
-        let survivors =
-            IcebergTableProvider::retain_delete_survivors(&context.state(), input, None)?;
-
-        let batches = datafusion::physical_plan::collect(survivors, context.task_ctx()).await?;
-        assert!(batches.is_empty());
+        let aggregate = provider.aggregate_statistics(&[incompatible, incomplete]);
+        assert_eq!(aggregate.column_statistics[0].min_value, Precision::Absent);
+        assert_eq!(aggregate.column_statistics[0].max_value, Precision::Absent);
+        assert_eq!(aggregate.column_statistics[0].null_count, Precision::Absent);
         Ok(())
     }
 }

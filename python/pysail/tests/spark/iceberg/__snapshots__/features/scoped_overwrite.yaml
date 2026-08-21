@@ -8,6 +8,9 @@ data:
   deleted-records: '0'
   operation: overwrite
   total-data-files: '3'
+  total-delete-files: '0'
+  total-equality-deletes: '0'
+  total-position-deletes: '0'
   total-records: '5'
 ---
 name: "test_dynamic_overwrite_replaces_only_touched_partitions_and_empty_input_is_a_noop"
@@ -70,7 +73,14 @@ data:
     sequence-number: 1
     snapshot-id: <snapshot-id>
     summary:
+      added-data-files: '1'
+      added-records: '2'
       operation: append
+      total-data-files: '1'
+      total-delete-files: '0'
+      total-equality-deletes: '0'
+      total-position-deletes: '0'
+      total-records: '2'
     timestamp-ms: <timestamp>
   - manifest-list: file://<root>/metadata/snap-<id>.avro
     parent-snapshot-id: <parent-snapshot-id>
@@ -78,7 +88,14 @@ data:
     sequence-number: 2
     snapshot-id: <snapshot-id>
     summary:
+      added-data-files: '1'
+      added-records: '2'
       operation: append
+      total-data-files: '2'
+      total-delete-files: '0'
+      total-equality-deletes: '0'
+      total-position-deletes: '0'
+      total-records: '4'
     timestamp-ms: <timestamp>
   - manifest-list: file://<root>/metadata/snap-<id>.avro
     parent-snapshot-id: <parent-snapshot-id>
@@ -92,6 +109,9 @@ data:
       deleted-records: '2'
       operation: overwrite
       total-data-files: '2'
+      total-delete-files: '0'
+      total-equality-deletes: '0'
+      total-position-deletes: '0'
       total-records: '4'
     timestamp-ms: <timestamp>
   sort-orders:
@@ -113,7 +133,7 @@ data:
     key-metadata: null
     manifest-length: <bytes>
     manifest-path: file://<root>/metadata/manifest-<uuid>.avro
-    min-sequence-number: 3
+    min-sequence-number: 1
     partition-spec-id: 0
     partitions: null
     sequence-number: 3
@@ -156,6 +176,9 @@ data:
   deleted-records: '2'
   operation: overwrite
   total-data-files: '2'
+  total-delete-files: '0'
+  total-equality-deletes: '0'
+  total-position-deletes: '0'
   total-records: '4'
 ---
 name: "test_dynamic_overwrite_replaces_only_touched_partitions_and_empty_input_is_a_noop.3"
@@ -239,7 +262,14 @@ data:
     sequence-number: 1
     snapshot-id: <snapshot-id>
     summary:
+      added-data-files: '1'
+      added-records: '2'
       operation: append
+      total-data-files: '1'
+      total-delete-files: '0'
+      total-equality-deletes: '0'
+      total-position-deletes: '0'
+      total-records: '2'
     timestamp-ms: <timestamp>
   - manifest-list: file://<root>/metadata/snap-<id>.avro
     parent-snapshot-id: <parent-snapshot-id>
@@ -247,7 +277,14 @@ data:
     sequence-number: 2
     snapshot-id: <snapshot-id>
     summary:
+      added-data-files: '1'
+      added-records: '2'
       operation: append
+      total-data-files: '2'
+      total-delete-files: '0'
+      total-equality-deletes: '0'
+      total-position-deletes: '0'
+      total-records: '4'
     timestamp-ms: <timestamp>
   - manifest-list: file://<root>/metadata/snap-<id>.avro
     parent-snapshot-id: <parent-snapshot-id>
@@ -261,6 +298,9 @@ data:
       deleted-records: '2'
       operation: overwrite
       total-data-files: '2'
+      total-delete-files: '0'
+      total-equality-deletes: '0'
+      total-position-deletes: '0'
       total-records: '4'
     timestamp-ms: <timestamp>
   sort-orders:
@@ -282,7 +322,7 @@ data:
     key-metadata: null
     manifest-length: <bytes>
     manifest-path: file://<root>/metadata/manifest-<uuid>.avro
-    min-sequence-number: 3
+    min-sequence-number: 1
     partition-spec-id: 0
     partitions: null
     sequence-number: 3
@@ -325,6 +365,9 @@ data:
   deleted-records: '2'
   operation: overwrite
   total-data-files: '2'
+  total-delete-files: '0'
+  total-equality-deletes: '0'
+  total-position-deletes: '0'
   total-records: '4'
 ---
 name: "test_predicate_overwrite_rewrites_only_candidate_manifests.3"
@@ -347,3 +390,16 @@ data:
       type: long
     schema-id: 0
     type: struct
+---
+name: "test_predicate_overwrite_with_empty_input_removes_matching_files"
+data:
+  added-data-files: '0'
+  added-records: '0'
+  deleted-data-files: '1'
+  deleted-records: '2'
+  operation: overwrite
+  total-data-files: '1'
+  total-delete-files: '0'
+  total-equality-deletes: '0'
+  total-position-deletes: '0'
+  total-records: '2'

@@ -12,7 +12,6 @@
 
 use std::sync::Arc;
 
-use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::Session;
 use datafusion::common::Result;
 use datafusion::physical_expr::expressions::Column;
@@ -24,9 +23,10 @@ use sail_common_datafusion::catalog::CatalogPartitionField;
 use sail_common_datafusion::datasource::PhysicalSinkMode;
 use url::Url;
 
+use crate::operations::SnapshotUpdateKind;
+use crate::physical_plan::write_context::IcebergWriteContext;
 use crate::physical_plan::writer_exec::IcebergWriterExec;
 use crate::physical_plan::writer_options::IcebergWriterExecOptions;
-use crate::spec::Operation;
 use crate::utils::partition_transform::format_partition_expr;
 
 pub struct IcebergTableConfig {
@@ -34,6 +34,7 @@ pub struct IcebergTableConfig {
     pub partition_columns: Vec<CatalogPartitionField>,
     pub table_exists: bool,
     pub options: IcebergWriterExecOptions,
+    pub write_context: IcebergWriteContext,
 }
 
 pub struct IcebergPlanBuilder<'a> {
@@ -41,10 +42,10 @@ pub struct IcebergPlanBuilder<'a> {
     table_config: IcebergTableConfig,
     sink_mode: PhysicalSinkMode,
     sort_order: Option<Vec<PhysicalSortExpr>>,
-    logical_input_schema: Option<SchemaRef>,
     expected_snapshot_id: Option<Option<i64>>,
     removed_data_file_paths: Vec<String>,
-    operation_override: Option<Operation>,
+    dynamic_partition_overwrite: bool,
+    snapshot_update_kind: Option<SnapshotUpdateKind>,
     #[expect(unused)]
     session: &'a dyn Session,
 }
@@ -55,7 +56,6 @@ impl<'a> IcebergPlanBuilder<'a> {
         table_config: IcebergTableConfig,
         sink_mode: PhysicalSinkMode,
         sort_order: Option<Vec<PhysicalSortExpr>>,
-        logical_input_schema: Option<SchemaRef>,
         session: &'a dyn Session,
     ) -> Self {
         Self {
@@ -63,10 +63,10 @@ impl<'a> IcebergPlanBuilder<'a> {
             table_config,
             sink_mode,
             sort_order,
-            logical_input_schema,
             expected_snapshot_id: None,
-            removed_data_file_paths: vec![],
-            operation_override: None,
+            removed_data_file_paths: Vec::new(),
+            dynamic_partition_overwrite: false,
+            snapshot_update_kind: None,
             session,
         }
     }
@@ -76,13 +76,18 @@ impl<'a> IcebergPlanBuilder<'a> {
         self
     }
 
-    pub fn with_rewrite_data_files(
-        mut self,
-        removed_data_file_paths: Vec<String>,
-        operation: Operation,
-    ) -> Self {
-        self.removed_data_file_paths = removed_data_file_paths;
-        self.operation_override = Some(operation);
+    pub fn with_removed_data_file_paths(mut self, paths: Vec<String>) -> Self {
+        self.removed_data_file_paths = paths;
+        self
+    }
+
+    pub fn with_dynamic_partition_overwrite(mut self, enabled: bool) -> Self {
+        self.dynamic_partition_overwrite = enabled;
+        self
+    }
+
+    pub fn with_snapshot_update_kind(mut self, kind: SnapshotUpdateKind) -> Self {
+        self.snapshot_update_kind = Some(kind);
         self
     }
 
@@ -169,22 +174,33 @@ impl<'a> IcebergPlanBuilder<'a> {
             self.sink_mode.clone(),
             self.table_config.table_exists,
             self.table_config.options.clone(),
-            self.logical_input_schema.clone(),
-        )))
+            self.table_config.write_context.clone(),
+        )?))
     }
 
     fn add_commit_node(&self, input: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
+        let snapshot_update_kind = self.snapshot_update_kind.unwrap_or({
+            if self.table_config.table_exists {
+                match &self.sink_mode {
+                    PhysicalSinkMode::Overwrite => SnapshotUpdateKind::FullOverwrite,
+                    PhysicalSinkMode::OverwriteIf { .. }
+                    | PhysicalSinkMode::OverwritePartitions => SnapshotUpdateKind::CopyOnWrite,
+                    _ => SnapshotUpdateKind::FastAppend,
+                }
+            } else {
+                SnapshotUpdateKind::FastAppend
+            }
+        });
         Ok(Arc::new(
             crate::physical_plan::commit::commit_exec::IcebergCommitExec::new(
                 input,
                 self.table_config.table_url.clone(),
                 self.table_config.options.lakehouse_table.clone(),
+                snapshot_update_kind,
             )
             .with_expected_snapshot_id(self.expected_snapshot_id)
-            .with_optional_rewrite_data_files(
-                self.removed_data_file_paths.clone(),
-                self.operation_override.clone(),
-            ),
+            .with_removed_data_file_paths(self.removed_data_file_paths.clone())
+            .with_dynamic_partition_overwrite(self.dynamic_partition_overwrite),
         ))
     }
 }
