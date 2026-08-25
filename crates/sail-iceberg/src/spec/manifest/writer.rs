@@ -79,6 +79,29 @@ impl ManifestWriter {
         self.entries.push(Arc::new(entry));
     }
 
+    pub fn add_existing_entry(&mut self, mut entry: ManifestEntry) -> Result<(), String> {
+        if entry.sequence_number.is_none() || entry.file_sequence_number.is_none() {
+            return Err(
+                "existing manifest entries require data and file sequence numbers".to_string(),
+            );
+        }
+        entry.status = ManifestStatus::Existing;
+        self.entries.push(Arc::new(entry));
+        Ok(())
+    }
+
+    pub fn add_deleted_entry(&mut self, mut entry: ManifestEntry) -> Result<(), String> {
+        if entry.sequence_number.is_none() || entry.file_sequence_number.is_none() {
+            return Err(
+                "deleted manifest entries require data and file sequence numbers".to_string(),
+            );
+        }
+        entry.status = ManifestStatus::Deleted;
+        entry.snapshot_id = self.snapshot_id;
+        self.entries.push(Arc::new(entry));
+        Ok(())
+    }
+
     pub fn finish(self) -> Manifest {
         Manifest::new(
             self.metadata,
@@ -206,5 +229,129 @@ impl ManifestWriter {
         writer
             .into_inner()
             .map_err(|e| format!("Avro writer finalize error: {e}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![expect(clippy::unwrap_used)]
+
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::spec::types::values::PrimitiveLiteral;
+    use crate::spec::types::{NestedField, PrimitiveType, Type};
+    use crate::spec::{
+        DataContentType, DataFileFormat, Datum, ManifestContentType, PartitionSpec, Schema,
+    };
+
+    fn data_file(path: &str) -> DataFile {
+        DataFile {
+            content: DataContentType::Data,
+            file_path: path.to_string(),
+            file_format: DataFileFormat::Parquet,
+            partition: vec![],
+            record_count: 1,
+            file_size_in_bytes: 100,
+            column_sizes: HashMap::new(),
+            value_counts: HashMap::new(),
+            null_value_counts: HashMap::new(),
+            nan_value_counts: HashMap::new(),
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
+            block_size_in_bytes: None,
+            key_metadata: None,
+            split_offsets: vec![],
+            equality_ids: vec![],
+            sort_order_id: None,
+            first_row_id: None,
+            partition_spec_id: 0,
+            referenced_data_file: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+        }
+    }
+
+    #[test]
+    fn typed_metric_bounds_survive_manifest_roundtrip() {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::optional(
+                    1,
+                    "amount",
+                    Type::Primitive(PrimitiveType::Decimal {
+                        precision: 10,
+                        scale: 2,
+                    }),
+                )),
+                Arc::new(NestedField::optional(
+                    2,
+                    "identifier",
+                    Type::Primitive(PrimitiveType::Uuid),
+                )),
+                Arc::new(NestedField::optional(
+                    3,
+                    "fixed",
+                    Type::Primitive(PrimitiveType::Fixed(3)),
+                )),
+                Arc::new(NestedField::optional(
+                    4,
+                    "binary",
+                    Type::Primitive(PrimitiveType::Binary),
+                )),
+            ])
+            .build()
+            .unwrap();
+        let metadata = ManifestMetadata::new(
+            Arc::new(schema),
+            0,
+            PartitionSpec::unpartitioned_spec(),
+            FormatVersion::V2,
+            ManifestContentType::Data,
+        );
+        let expected = HashMap::from([
+            (
+                1,
+                Datum::new(
+                    PrimitiveType::Decimal {
+                        precision: 10,
+                        scale: 2,
+                    },
+                    PrimitiveLiteral::Int128(-12_345),
+                ),
+            ),
+            (
+                2,
+                Datum::new(
+                    PrimitiveType::Uuid,
+                    PrimitiveLiteral::UInt128(0x0011_2233_4455_6677_8899_aabb_ccdd_eeff),
+                ),
+            ),
+            (
+                3,
+                Datum::new(
+                    PrimitiveType::Fixed(3),
+                    PrimitiveLiteral::Binary(vec![1, 2, 3]),
+                ),
+            ),
+            (
+                4,
+                Datum::new(
+                    PrimitiveType::Binary,
+                    PrimitiveLiteral::Binary(vec![4, 5, 6]),
+                ),
+            ),
+        ]);
+        let mut file = data_file("data/typed.parquet");
+        file.lower_bounds = expected.clone();
+        file.upper_bounds = expected.clone();
+        let mut writer = ManifestWriterBuilder::new(Some(20), None, metadata).build();
+        writer.add(file);
+
+        let bytes = writer.to_avro_bytes_v2().unwrap();
+        let manifest = Manifest::parse_avro(&bytes).unwrap();
+
+        assert_eq!(manifest.entries[0].data_file.lower_bounds, expected);
+        assert_eq!(manifest.entries[0].data_file.upper_bounds, expected);
     }
 }

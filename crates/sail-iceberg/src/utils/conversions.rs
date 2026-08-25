@@ -72,21 +72,22 @@ fn primitive_literal_to_scalar(prim: &PrimitiveLiteral, prim_type: &PrimitiveTyp
         (PrimitiveType::Decimal { precision, scale }, PL::Int128(v)) => {
             SV::Decimal128(Some(*v), *precision as u8, *scale as i8)
         }
-        // UUID: UInt128 -> could be represented as string or binary, use string for now
-        (PrimitiveType::Uuid, PL::UInt128(u)) => {
-            let mut bytes = [0u8; 16];
-            let mut tmp = *u;
-            for i in (0..16).rev() {
-                bytes[i] = (tmp & 0xFF) as u8;
-                tmp >>= 8;
-            }
-            let uuid = uuid::Uuid::from_bytes(bytes);
-            SV::Utf8(Some(uuid.to_string()))
+        // UUID: UInt128 -> Arrow fixed-size binary
+        (PrimitiveType::Uuid, PL::UInt128(value)) => {
+            SV::FixedSizeBinary(16, Some(value.to_be_bytes().to_vec()))
         }
-        // Fixed/Binary: Binary -> Binary
-        (PrimitiveType::Fixed(_), PL::Binary(b)) | (PrimitiveType::Binary, PL::Binary(b)) => {
-            SV::Binary(Some(b.clone()))
-        }
+        // Fixed: use Arrow fixed-size binary when the Iceberg length fits Arrow's i32 size.
+        (PrimitiveType::Fixed(length), PL::Binary(value)) => match i32::try_from(*length) {
+            Ok(length) => SV::FixedSizeBinary(length, Some(value.clone())),
+            Err(_) => SV::LargeBinary(Some(value.clone())),
+        },
+        // Variable-width binary primitives map to Arrow large binary.
+        (
+            PrimitiveType::Binary
+            | PrimitiveType::Geometry { .. }
+            | PrimitiveType::Geography { .. },
+            PL::Binary(value),
+        ) => SV::LargeBinary(Some(value.clone())),
         // Iceberg encodes String lower/upper bounds as raw bytes (UTF-8) in file metrics.
         // Decode them so pruning predicates comparing against Utf8 literals work.
         (PrimitiveType::String, PL::Binary(b)) => {
@@ -442,6 +443,36 @@ mod tests {
         assert_eq!(
             primitive_literal_to_scalar(&lit, &ty),
             ScalarValue::TimestampNanosecond(Some(42_000), None)
+        );
+    }
+
+    #[test]
+    fn test_binary_literal_to_scalar_with_type() {
+        let uuid = 0x0011_2233_4455_6677_8899_aabb_ccdd_eeff_u128;
+        assert_eq!(
+            primitive_literal_to_scalar(&PrimitiveLiteral::UInt128(uuid), &PrimitiveType::Uuid),
+            ScalarValue::FixedSizeBinary(16, Some(uuid.to_be_bytes().to_vec()))
+        );
+        assert_eq!(
+            primitive_literal_to_scalar(
+                &PrimitiveLiteral::Binary(vec![1, 2, 3]),
+                &PrimitiveType::Fixed(3),
+            ),
+            ScalarValue::FixedSizeBinary(3, Some(vec![1, 2, 3]))
+        );
+        assert_eq!(
+            primitive_literal_to_scalar(
+                &PrimitiveLiteral::Binary(vec![1, 2, 3]),
+                &PrimitiveType::Binary,
+            ),
+            ScalarValue::LargeBinary(Some(vec![1, 2, 3]))
+        );
+        assert_eq!(
+            primitive_literal_to_scalar(
+                &PrimitiveLiteral::Binary(vec![1, 2, 3]),
+                &PrimitiveType::Geometry { crs: None },
+            ),
+            ScalarValue::LargeBinary(Some(vec![1, 2, 3]))
         );
     }
 
