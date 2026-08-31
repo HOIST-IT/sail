@@ -1913,22 +1913,19 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn ignored_write_modes_reject_expected_snapshot_before_catalog_lookup() {
+    #[tokio::test]
+    async fn ignored_write_modes_reject_expected_snapshot_before_catalog_lookup() {
         for mode in [WriteMode::ErrorIfExists, WriteMode::IgnoreIfExists] {
             let lookup_called = AtomicBool::new(false);
             let options = vec![OptionLayer::OptionList {
                 items: vec![("EXPECTED-SNAPSHOT-ID".to_string(), "17".to_string())],
             }];
 
-            let error = futures::executor::block_on(resolve_table_info_after_control_guard(
-                &mode,
-                &options,
-                || {
-                    lookup_called.store(true, Ordering::SeqCst);
-                    async { Ok::<_, PlanError>(()) }
-                },
-            ))
+            let error = resolve_table_info_after_control_guard(&mode, &options, || {
+                lookup_called.store(true, Ordering::SeqCst);
+                async { Ok::<_, PlanError>(()) }
+            })
+            .await
             .expect_err("ignored controlled write must fail");
 
             assert!(error.to_string().contains("expected-snapshot-id"));
@@ -1936,14 +1933,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn nonignored_write_mode_reaches_catalog_lookup_spy() {
+    #[tokio::test]
+    async fn nonignored_write_mode_reaches_catalog_lookup_spy() {
         let lookup_called = AtomicBool::new(false);
         let options = vec![OptionLayer::OptionList {
             items: vec![("expected-snapshot-id".to_string(), "17".to_string())],
         }];
 
-        let result = futures::executor::block_on(resolve_table_info_after_control_guard(
+        let result = resolve_table_info_after_control_guard(
             &WriteMode::Append {
                 error_if_absent: false,
             },
@@ -1952,7 +1949,8 @@ mod tests {
                 lookup_called.store(true, Ordering::SeqCst);
                 async { Ok::<_, PlanError>("catalog-result") }
             },
-        ))
+        )
+        .await
         .expect("append lookup result");
 
         assert_eq!(result, "catalog-result");

@@ -3174,7 +3174,8 @@ mod tests {
                     "data/relative.parquet".to_string(),
                 ],
             )
-            .await;
+            .await
+            .expect("clean up task files");
 
             assert!(matches!(
                 memory.head(&absolute_path).await,
