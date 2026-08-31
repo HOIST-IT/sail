@@ -21,6 +21,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use datafusion_common::{DataFusionError, Result};
 use object_store::ObjectStoreExt;
+use sail_catalog::error::CatalogError;
 use url::Url;
 
 use crate::io::StoreContext;
@@ -60,6 +61,39 @@ pub enum NewTableMetadataStyle {
 pub struct BootstrapResult {
     pub table_metadata: TableMetadata,
     pub metadata_file: String,
+    created_paths: Vec<object_store::path::Path>,
+}
+
+impl BootstrapResult {
+    pub(crate) async fn cleanup(self, store_ctx: &StoreContext) -> Result<()> {
+        let metadata_path = object_store::path::Path::from(self.metadata_file);
+        match store_ctx.prefixed.delete(&metadata_path).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+            Err(error) => {
+                return Err(DataFusionError::External(Box::new(
+                    CatalogError::CommitStateUnknown(format!(
+                        "failed to remove uncommitted Iceberg bootstrap metadata {metadata_path}; dependent artifacts were retained: {error}"
+                    )),
+                )));
+            }
+        }
+
+        let mut failures = Vec::new();
+        for path in self.created_paths.into_iter().rev() {
+            match store_ctx.prefixed.delete(&path).await {
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+                Err(error) => failures.push(format!("{path}: {error}")),
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(DataFusionError::Execution(format!(
+                "failed to clean uncommitted Iceberg bootstrap artifacts after metadata removal: {}",
+                failures.join("; ")
+            )))
+        }
+    }
 }
 
 fn initial_metadata_version(metadata_style: NewTableMetadataStyle) -> i32 {
@@ -94,17 +128,24 @@ async fn write_metadata_version(
     let metadata_path = object_store::path::Path::from(metadata_file.as_str());
     store_ctx
         .prefixed
-        .put(
+        .put_opts(
             &metadata_path,
             object_store::PutPayload::from(Bytes::from(metadata_bytes)),
+            object_store::PutOptions {
+                mode: object_store::PutMode::Create,
+                ..Default::default()
+            },
         )
         .await
         .map_err(|error| DataFusionError::External(Box::new(error)))?;
-    write_version_hint(&store_ctx.prefixed, &version_hint).await;
+    if matches!(metadata_style, NewTableMetadataStyle::Hadoop) {
+        write_version_hint(&store_ctx.prefixed, &version_hint).await;
+    }
 
     Ok(BootstrapResult {
         table_metadata,
         metadata_file,
+        created_paths: Vec::new(),
     })
 }
 
@@ -160,6 +201,7 @@ pub(crate) async fn prepare_bootstrap_snapshot(
         Some(manifest_metadata),
     )
     .with_bootstrap(true)
+    .with_snapshot_properties(commit_info.snapshot_properties.clone())
     .with_added_delete_files(commit_info.delete_files.clone())
     .with_partition_specs(table_metadata.partition_specs.clone())
     .with_row_lineage_start_row_id(row_lineage_start_row_id)
@@ -244,6 +286,7 @@ pub async fn bootstrap_new_table_with_style(
         Some(manifest_metadata),
     )
     .with_bootstrap(true)
+    .with_snapshot_properties(commit_info.snapshot_properties.clone())
     .with_added_delete_files(commit_info.delete_files.clone())
     .with_partition_specs(vec![partition_spec.clone()])
     .with_row_lineage_start_row_id(row_lineage_start_row_id)
@@ -264,10 +307,8 @@ pub async fn bootstrap_new_table_with_style(
         }) {
         Some(snapshot) => snapshot,
         None => {
-            prepared_snapshot.cleanup().await;
-            return Err(DataFusionError::Plan(
-                "No snapshot in bootstrap commit".to_string(),
-            ));
+            let error = DataFusionError::Plan("No snapshot in bootstrap commit".to_string());
+            return Err(prepared_snapshot.cleanup_after(error).await);
         }
     };
 
@@ -315,17 +356,20 @@ pub async fn bootstrap_new_table_with_style(
     };
     table_metadata.ensure_required_format_fields();
 
-    let metadata_result = write_metadata_version(
+    match write_metadata_version(
         store_ctx,
         table_metadata,
         initial_metadata_version(metadata_style),
         metadata_style,
     )
-    .await;
-    if metadata_result.is_err() {
-        prepared_snapshot.cleanup().await;
+    .await
+    {
+        Ok(mut result) => {
+            result.created_paths = prepared_snapshot.into_created_paths();
+            Ok(result)
+        }
+        Err(error) => Err(prepared_snapshot.cleanup_after(error).await),
     }
-    metadata_result
 }
 
 pub async fn bootstrap_empty_table_metadata(
@@ -490,10 +534,8 @@ pub async fn bootstrap_first_snapshot(
         }) {
         Some(snapshot) => snapshot,
         None => {
-            prepared_snapshot.cleanup().await;
-            return Err(DataFusionError::Plan(
-                "No snapshot in bootstrap commit".to_string(),
-            ));
+            let error = DataFusionError::Plan("No snapshot in bootstrap commit".to_string());
+            return Err(prepared_snapshot.cleanup_after(error).await);
         }
     };
 
@@ -538,12 +580,13 @@ pub async fn bootstrap_first_snapshot(
         PersistStrategy::NewVersion => NewTableMetadataStyle::Hadoop,
         PersistStrategy::NewUuidVersion => NewTableMetadataStyle::Uuid,
     };
-    let metadata_result =
-        write_metadata_version(store_ctx, table_metadata, version, metadata_style).await;
-    if metadata_result.is_err() {
-        prepared_snapshot.cleanup().await;
+    match write_metadata_version(store_ctx, table_metadata, version, metadata_style).await {
+        Ok(mut result) => {
+            result.created_paths = prepared_snapshot.into_created_paths();
+            Ok(result)
+        }
+        Err(error) => Err(prepared_snapshot.cleanup_after(error).await),
     }
-    metadata_result
 }
 
 #[cfg(test)]
@@ -718,6 +761,8 @@ mod tests {
                 updates: vec![],
                 requirements: vec![],
                 table_properties: vec![("format-version".to_string(), "2".to_string())],
+                snapshot_properties: vec![],
+                caller_expected_snapshot_id: None,
                 lakehouse_table: None,
                 snapshot_update_kind: crate::operations::SnapshotUpdateKind::FastAppend,
                 schema: Some(schema),
@@ -739,6 +784,135 @@ mod tests {
                 .await
                 .expect("list objects after failed bootstrap");
             assert!(remaining.is_empty(), "remaining objects: {remaining:?}");
+        });
+    }
+
+    fn publication_commit_info(
+        table_url: &Url,
+        schema: IcebergSchema,
+        partition_spec: PartitionSpec,
+    ) -> IcebergCommitInfo {
+        IcebergCommitInfo {
+            table_uri: table_url.to_string(),
+            row_count: 0,
+            data_files: vec![],
+            delete_files: vec![],
+            manifest_path: String::new(),
+            manifest_list_path: String::new(),
+            updates: vec![],
+            requirements: vec![],
+            table_properties: vec![("format-version".to_string(), "2".to_string())],
+            snapshot_properties: vec![
+                ("hoist.plan-digest".to_string(), "sha256:AbC".to_string()),
+                (
+                    "hoist.publication-id".to_string(),
+                    "Publication-1".to_string(),
+                ),
+            ],
+            caller_expected_snapshot_id: None,
+            lakehouse_table: None,
+            snapshot_update_kind: crate::operations::SnapshotUpdateKind::FastAppend,
+            schema: Some(schema),
+            partition_spec: Some(partition_spec),
+        }
+    }
+
+    fn assert_publication_properties(metadata: &TableMetadata) {
+        let snapshot = metadata.current_snapshot().expect("current snapshot");
+        assert_eq!(
+            snapshot
+                .summary
+                .additional_properties
+                .get("hoist.plan-digest"),
+            Some(&"sha256:AbC".to_string())
+        );
+        assert_eq!(
+            snapshot
+                .summary
+                .additional_properties
+                .get("hoist.publication-id"),
+            Some(&"Publication-1".to_string())
+        );
+    }
+
+    #[test]
+    fn new_table_bootstrap_styles_preserve_snapshot_properties() {
+        futures::executor::block_on(async {
+            for (style, suffix) in [
+                (NewTableMetadataStyle::Hadoop, "hadoop"),
+                (NewTableMetadataStyle::Uuid, "uuid"),
+            ] {
+                let table_url = Url::parse(&format!(
+                    "file:///tmp/bootstrap-snapshot-properties-{suffix}/"
+                ))
+                .expect("table URL");
+                let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+                let store_ctx = StoreContext::new(store, &table_url).expect("store context");
+                let schema = IcebergSchema::builder()
+                    .with_schema_id(1)
+                    .with_fields([Arc::new(NestedField::required(
+                        1,
+                        "id",
+                        Type::Primitive(PrimitiveType::Int),
+                    ))])
+                    .build()
+                    .expect("schema");
+                let partition_spec = PartitionSpec::builder().with_spec_id(1).build();
+                let commit_info = publication_commit_info(&table_url, schema, partition_spec);
+
+                let result =
+                    bootstrap_new_table_with_style(&table_url, &store_ctx, &commit_info, style)
+                        .await
+                        .expect("new-table bootstrap");
+
+                assert_publication_properties(&result.table_metadata);
+            }
+        });
+    }
+
+    #[test]
+    fn existing_empty_table_bootstrap_preserves_snapshot_properties() {
+        futures::executor::block_on(async {
+            let table_url = Url::parse("file:///tmp/existing-empty-bootstrap-snapshot-properties/")
+                .expect("table URL");
+            let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+            let store_ctx = StoreContext::new(store, &table_url).expect("store context");
+            let schema = IcebergSchema::builder()
+                .with_schema_id(1)
+                .with_fields([Arc::new(NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Int),
+                ))])
+                .build()
+                .expect("schema");
+            let partition_spec = PartitionSpec::builder().with_spec_id(1).build();
+            let properties = vec![("format-version".to_string(), "2".to_string())];
+            let empty = bootstrap_empty_table_metadata(
+                &table_url,
+                &store_ctx,
+                schema.clone(),
+                partition_spec.clone(),
+                &properties,
+                NewTableMetadataStyle::Hadoop,
+            )
+            .await
+            .expect("empty table metadata");
+            let commit_info = publication_commit_info(&table_url, schema, partition_spec);
+
+            let result = bootstrap_first_snapshot(
+                &table_url,
+                &store_ctx,
+                &commit_info,
+                empty.table_metadata,
+                &empty.metadata_file,
+                None,
+                PersistStrategy::NewVersion,
+            )
+            .await
+            .expect("first-snapshot bootstrap");
+
+            assert_publication_properties(&result.table_metadata);
         });
     }
 

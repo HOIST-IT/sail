@@ -1452,22 +1452,37 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                 snapshot_update_kind,
                 dynamic_partition_overwrite,
                 removed_data_file_paths,
+                snapshot_properties,
+                caller_expected_snapshot_id,
+                controlled_snapshot_update_kind,
             }) => {
                 let input = try_decode_physical_plan(ctx, self, &input)?;
                 let table_url = Url::parse(&table_url)
                     .map_err(|e| plan_datafusion_err!("failed to parse table URL: {e}"))?;
                 let lakehouse_table = self.try_decode_lakehouse_table(&lakehouse_table_json)?;
-                let snapshot_update_kind =
-                    Self::try_decode_iceberg_snapshot_update_kind(snapshot_update_kind)?;
+                let snapshot_properties = snapshot_properties
+                    .into_iter()
+                    .map(|property| (property.key, property.value))
+                    .collect::<Vec<_>>();
+                let has_publication_controls =
+                    !snapshot_properties.is_empty() || caller_expected_snapshot_id.is_some();
+                let snapshot_update_kind = Self::try_decode_iceberg_commit_snapshot_update_kind(
+                    snapshot_update_kind,
+                    controlled_snapshot_update_kind,
+                    has_publication_controls,
+                )?;
 
-                Ok(Arc::new(
+                let commit =
                     IcebergCommitExec::new(input, table_url, lakehouse_table, snapshot_update_kind)
                         .with_expected_snapshot_id(
                             validate_read_snapshot.then_some(expected_snapshot_id),
                         )
+                        .with_caller_expected_snapshot_id(caller_expected_snapshot_id)
+                        .with_snapshot_properties(snapshot_properties)
                         .with_dynamic_partition_overwrite(dynamic_partition_overwrite)
-                        .with_removed_data_file_paths(removed_data_file_paths),
-                ))
+                        .with_removed_data_file_paths(removed_data_file_paths);
+                commit.validate_publication_controls()?;
+                Ok(Arc::new(commit))
             }
             NodeKind::IcebergManifestScan(r#gen::IcebergManifestScanExecNode {
                 table_url,
@@ -2397,8 +2412,23 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                 write_context_json,
             })
         } else if let Some(iceberg_commit_exec) = node.downcast_ref::<IcebergCommitExec>() {
+            iceberg_commit_exec.validate_publication_controls()?;
             let input = try_encode_physical_plan(self, iceberg_commit_exec.input().clone())?;
             let expected_snapshot_id = iceberg_commit_exec.expected_snapshot_id();
+            let encoded_snapshot_update_kind = Self::try_encode_iceberg_snapshot_update_kind(
+                iceberg_commit_exec.snapshot_update_kind(),
+            );
+            let has_publication_controls = !iceberg_commit_exec.snapshot_properties().is_empty()
+                || iceberg_commit_exec.caller_expected_snapshot_id().is_some();
+            let (snapshot_update_kind, controlled_snapshot_update_kind) =
+                if has_publication_controls {
+                    (
+                        r#gen::IcebergSnapshotUpdateKind::Unspecified as i32,
+                        Some(encoded_snapshot_update_kind),
+                    )
+                } else {
+                    (encoded_snapshot_update_kind, None)
+                };
             NodeKind::IcebergCommit(r#gen::IcebergCommitExecNode {
                 input,
                 table_url: iceberg_commit_exec.table_url().to_string(),
@@ -2406,11 +2436,19 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                     .try_encode_lakehouse_table(iceberg_commit_exec.lakehouse_table())?,
                 validate_read_snapshot: expected_snapshot_id.is_some(),
                 expected_snapshot_id: expected_snapshot_id.flatten(),
-                snapshot_update_kind: Self::try_encode_iceberg_snapshot_update_kind(
-                    iceberg_commit_exec.snapshot_update_kind(),
-                ),
+                snapshot_update_kind,
                 dynamic_partition_overwrite: iceberg_commit_exec.dynamic_partition_overwrite(),
                 removed_data_file_paths: iceberg_commit_exec.removed_data_file_paths().to_vec(),
+                snapshot_properties: iceberg_commit_exec
+                    .snapshot_properties()
+                    .iter()
+                    .map(|(key, value)| r#gen::IcebergSnapshotProperty {
+                        key: key.clone(),
+                        value: value.clone(),
+                    })
+                    .collect(),
+                caller_expected_snapshot_id: iceberg_commit_exec.caller_expected_snapshot_id(),
+                controlled_snapshot_update_kind,
             })
         } else if let Some(manifest_scan) = node.downcast_ref::<IcebergManifestScanExec>() {
             let snapshot_json = serde_json::to_string(manifest_scan.snapshot())
@@ -4196,6 +4234,23 @@ impl RemoteExecutionCodec {
         }
     }
 
+    fn try_decode_iceberg_commit_snapshot_update_kind(
+        legacy_kind: i32,
+        controlled_kind: Option<i32>,
+        has_publication_controls: bool,
+    ) -> Result<SnapshotUpdateKind> {
+        let unspecified = r#gen::IcebergSnapshotUpdateKind::Unspecified as i32;
+        match (
+            has_publication_controls,
+            legacy_kind == unspecified,
+            controlled_kind,
+        ) {
+            (false, false, None) => Self::try_decode_iceberg_snapshot_update_kind(legacy_kind),
+            (true, true, Some(kind)) => Self::try_decode_iceberg_snapshot_update_kind(kind),
+            _ => plan_err!("inconsistent Iceberg commit publication-control encoding"),
+        }
+    }
+
     fn try_encode_iceberg_snapshot_update_kind(kind: SnapshotUpdateKind) -> i32 {
         (match kind {
             SnapshotUpdateKind::FastAppend => r#gen::IcebergSnapshotUpdateKind::FastAppend,
@@ -5114,6 +5169,159 @@ mod tests {
                 assert!(commit.dynamic_partition_overwrite());
                 assert_eq!(commit.removed_data_file_paths(), &["data/old.parquet"]);
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_iceberg_commit_without_publication_controls_keeps_legacy_wire_shape() -> Result<()> {
+        use datafusion::physical_plan::empty::EmptyExec;
+
+        let snapshot_update_kind = SnapshotUpdateKind::CopyOnWrite;
+        let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(Arc::new(Schema::empty())));
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(
+            IcebergCommitExec::new(
+                input,
+                Url::parse("file:///tmp/iceberg-legacy-commit-codec/")
+                    .map_err(|error| plan_datafusion_err!("{error}"))?,
+                None,
+                snapshot_update_kind,
+            )
+            .with_expected_snapshot_id(Some(Some(42))),
+        );
+
+        let codec = RemoteExecutionCodec;
+        let mut bytes = Vec::new();
+        codec.try_encode(plan, &mut bytes)?;
+        let extended = r#gen::ExtendedPhysicalPlanNode::decode(bytes.as_slice())
+            .map_err(|error| plan_datafusion_err!("{error}"))?;
+        let Some(NodeKind::IcebergCommit(node)) = extended.node_kind else {
+            return plan_err!("encoded plan is not an IcebergCommitExec");
+        };
+        let encoded_update_kind =
+            RemoteExecutionCodec::try_encode_iceberg_snapshot_update_kind(snapshot_update_kind);
+        assert_eq!(node.snapshot_update_kind, encoded_update_kind);
+        assert!(node.snapshot_properties.is_empty());
+        assert_eq!(node.caller_expected_snapshot_id, None);
+        assert_eq!(node.controlled_snapshot_update_kind, None);
+        assert_eq!(
+            RemoteExecutionCodec::try_decode_iceberg_snapshot_update_kind(
+                node.snapshot_update_kind
+            )?,
+            snapshot_update_kind
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_iceberg_commit_publication_controls_use_fail_closed_wire_sentinel() -> Result<()> {
+        use datafusion::physical_plan::empty::EmptyExec;
+
+        let snapshot_update_kind = SnapshotUpdateKind::CopyOnWrite;
+        let snapshot_properties = vec![
+            ("hoist.plan-digest".to_string(), "sha256:abc123".to_string()),
+            (
+                "hoist.publication-id".to_string(),
+                "publication-123".to_string(),
+            ),
+        ];
+        let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(Arc::new(Schema::empty())));
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(
+            IcebergCommitExec::new(
+                input,
+                Url::parse("file:///tmp/iceberg-controlled-commit-codec/")
+                    .map_err(|error| plan_datafusion_err!("{error}"))?,
+                None,
+                snapshot_update_kind,
+            )
+            .with_caller_expected_snapshot_id(Some(42))
+            .with_snapshot_properties(snapshot_properties.clone()),
+        );
+
+        let codec = RemoteExecutionCodec;
+        let mut bytes = Vec::new();
+        codec.try_encode(plan, &mut bytes)?;
+        let extended = r#gen::ExtendedPhysicalPlanNode::decode(bytes.as_slice())
+            .map_err(|error| plan_datafusion_err!("{error}"))?;
+        let Some(NodeKind::IcebergCommit(node)) = extended.node_kind else {
+            return plan_err!("encoded plan is not an IcebergCommitExec");
+        };
+        let encoded_update_kind =
+            RemoteExecutionCodec::try_encode_iceberg_snapshot_update_kind(snapshot_update_kind);
+        assert_eq!(
+            node.snapshot_update_kind,
+            r#gen::IcebergSnapshotUpdateKind::Unspecified as i32
+        );
+        assert_eq!(
+            node.controlled_snapshot_update_kind,
+            Some(encoded_update_kind)
+        );
+        assert_eq!(node.caller_expected_snapshot_id, Some(42));
+        assert_eq!(
+            node.snapshot_properties
+                .iter()
+                .map(|property| (property.key.clone(), property.value.clone()))
+                .collect::<Vec<_>>(),
+            snapshot_properties
+        );
+        assert!(
+            RemoteExecutionCodec::try_decode_iceberg_snapshot_update_kind(
+                node.snapshot_update_kind
+            )
+            .is_err()
+        );
+
+        let decoded = codec.try_decode(&bytes, &[], &TaskContext::default())?;
+        let commit = decoded
+            .downcast_ref::<IcebergCommitExec>()
+            .ok_or_else(|| plan_datafusion_err!("decoded plan is not an IcebergCommitExec"))?;
+        assert_eq!(commit.snapshot_update_kind(), snapshot_update_kind);
+        assert_eq!(commit.caller_expected_snapshot_id(), Some(42));
+        assert_eq!(commit.snapshot_properties(), snapshot_properties);
+        Ok(())
+    }
+
+    #[test]
+    fn test_decode_iceberg_commit_rejects_inconsistent_publication_control_encoding() -> Result<()>
+    {
+        let real_kind = RemoteExecutionCodec::try_encode_iceberg_snapshot_update_kind(
+            SnapshotUpdateKind::FastAppend,
+        );
+        let unspecified = r#gen::IcebergSnapshotUpdateKind::Unspecified as i32;
+
+        assert_eq!(
+            RemoteExecutionCodec::try_decode_iceberg_commit_snapshot_update_kind(
+                real_kind, None, false,
+            )?,
+            SnapshotUpdateKind::FastAppend
+        );
+        assert_eq!(
+            RemoteExecutionCodec::try_decode_iceberg_commit_snapshot_update_kind(
+                unspecified,
+                Some(real_kind),
+                true,
+            )?,
+            SnapshotUpdateKind::FastAppend
+        );
+
+        for (has_controls, legacy_kind, controlled_kind) in [
+            (false, unspecified, None),
+            (false, real_kind, Some(real_kind)),
+            (false, unspecified, Some(real_kind)),
+            (true, real_kind, None),
+            (true, real_kind, Some(real_kind)),
+            (true, unspecified, None),
+            (true, unspecified, Some(unspecified)),
+        ] {
+            assert!(
+                RemoteExecutionCodec::try_decode_iceberg_commit_snapshot_update_kind(
+                    legacy_kind,
+                    controlled_kind,
+                    has_controls,
+                )
+                .is_err(),
+                "accepted inconsistent encoding: controls={has_controls}, legacy={legacy_kind}, controlled={controlled_kind:?}"
+            );
         }
         Ok(())
     }

@@ -13,6 +13,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use bytes::Bytes;
+use datafusion_common::DataFusionError;
 use futures::StreamExt;
 use object_store::ObjectStoreExt;
 use object_store::path::Path as ObjectPath;
@@ -20,6 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{ActionCommit, Transaction};
 use crate::io::StoreContext;
+use crate::snapshot_properties::{insert_snapshot_properties, validate_snapshot_properties};
 use crate::spec::manifest::{ManifestEntry, ManifestWriter, ManifestWriterBuilder};
 use crate::spec::manifest_list::ManifestListWriter;
 use crate::spec::{
@@ -347,6 +349,7 @@ pub struct SnapshotProducer<'a> {
     pub tx: &'a Transaction,
     pub added_data_files: Vec<DataFile>,
     pub added_delete_files: Vec<DataFile>,
+    pub snapshot_properties: Vec<(String, String)>,
     pub removed_data_file_paths: Vec<String>,
     pub store_ctx: Option<StoreContext>,
     pub manifest_metadata: Option<crate::spec::manifest::ManifestMetadata>,
@@ -372,22 +375,45 @@ impl PreparedSnapshotCommit {
         self.action_commit
     }
 
-    pub(crate) async fn cleanup(self) {
-        cleanup_created_paths(&self.store_ctx, &self.created_paths).await;
+    pub(crate) fn into_created_paths(self) -> Vec<ObjectPath> {
+        self.created_paths
+    }
+
+    pub(crate) async fn cleanup(self) -> std::result::Result<(), DataFusionError> {
+        cleanup_created_paths(&self.store_ctx, &self.created_paths).await
+    }
+
+    pub(crate) async fn cleanup_after(self, error: DataFusionError) -> DataFusionError {
+        match self.cleanup().await {
+            Ok(()) => error,
+            Err(cleanup_error) => DataFusionError::Execution(format!(
+                "{error}; failed to clean uncommitted Iceberg snapshot artifacts: {cleanup_error}"
+            )),
+        }
     }
 }
 
-async fn cleanup_created_paths(store_ctx: &StoreContext, paths: &[ObjectPath]) {
+async fn cleanup_created_paths(
+    store_ctx: &StoreContext,
+    paths: &[ObjectPath],
+) -> std::result::Result<(), DataFusionError> {
     let paths = paths.iter().rev().cloned().collect::<Vec<_>>();
     let locations = futures::stream::iter(paths.into_iter().map(Ok));
     let mut deletions = store_ctx.prefixed.delete_stream(Box::pin(locations));
+    let mut failures = Vec::new();
     while let Some(result) = deletions.next().await {
         match result {
             Ok(_) | Err(object_store::Error::NotFound { .. }) => {}
-            Err(error) => {
-                log::warn!("Failed to remove an uncommitted Iceberg object: {error}");
-            }
+            Err(error) => failures.push(error.to_string()),
         }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(DataFusionError::Execution(format!(
+            "failed to remove uncommitted Iceberg objects: {}",
+            failures.join("; ")
+        )))
     }
 }
 
@@ -402,6 +428,7 @@ impl<'a> SnapshotProducer<'a> {
             tx,
             added_data_files,
             added_delete_files: Vec::new(),
+            snapshot_properties: Vec::new(),
             removed_data_file_paths: Vec::new(),
             store_ctx,
             manifest_metadata,
@@ -431,6 +458,11 @@ impl<'a> SnapshotProducer<'a> {
 
     pub fn with_added_delete_files(mut self, delete_files: Vec<DataFile>) -> Self {
         self.added_delete_files = delete_files;
+        self
+    }
+
+    pub fn with_snapshot_properties(mut self, properties: Vec<(String, String)>) -> Self {
+        self.snapshot_properties = properties;
         self
     }
 
@@ -685,10 +717,12 @@ impl<'a> SnapshotProducer<'a> {
                 store_ctx,
                 created_paths,
             }),
-            Err(error) => {
-                cleanup_created_paths(&store_ctx, &created_paths).await;
-                Err(error)
-            }
+            Err(error) => match cleanup_created_paths(&store_ctx, &created_paths).await {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(format!(
+                    "{error}; failed to clean snapshot preparation artifacts: {cleanup_error}"
+                )),
+            },
         }
     }
 
@@ -697,6 +731,8 @@ impl<'a> SnapshotProducer<'a> {
         update_kind: SnapshotUpdateKind,
         created_paths: &mut Vec<ObjectPath>,
     ) -> Result<ActionCommit, String> {
+        validate_snapshot_properties(&self.snapshot_properties)
+            .map_err(|error| error.to_string())?;
         let removed_data_file_paths = self
             .removed_data_file_paths
             .iter()
@@ -1018,6 +1054,8 @@ impl<'a> SnapshotProducer<'a> {
             added_position_deletes,
             added_equality_deletes,
         );
+        insert_snapshot_properties(&mut summary, &self.snapshot_properties)
+            .map_err(|error| error.to_string())?;
 
         let mut list_writer = ManifestListWriter::new();
         let mut total_manifest_count = 0;
@@ -1127,8 +1165,8 @@ mod tests {
     use std::ops::Range;
     use std::sync::Arc;
 
-    use futures::TryStreamExt;
     use futures::stream::BoxStream;
+    use futures::{StreamExt, TryStreamExt};
     use object_store::path::Path;
     use object_store::{
         CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
@@ -1223,6 +1261,144 @@ mod tests {
         ) -> object_store::Result<()> {
             self.memory_store.copy_opts(from, to, options).await
         }
+    }
+
+    #[derive(Debug)]
+    struct DeleteRejectingStore {
+        memory_store: Arc<object_store::memory::InMemory>,
+        rejected_suffix: &'static str,
+    }
+
+    impl std::fmt::Display for DeleteRejectingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "DeleteRejectingStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for DeleteRejectingStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.memory_store.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.memory_store.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            self.memory_store.get_opts(location, options).await
+        }
+
+        async fn get_ranges(
+            &self,
+            location: &Path,
+            ranges: &[Range<u64>],
+        ) -> object_store::Result<Vec<Bytes>> {
+            self.memory_store.get_ranges(location, ranges).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            let memory_store = Arc::clone(&self.memory_store);
+            let rejected_suffix = self.rejected_suffix;
+            Box::pin(locations.then(move |location| {
+                let memory_store = Arc::clone(&memory_store);
+                async move {
+                    let location = location?;
+                    if location.as_ref().ends_with(rejected_suffix) {
+                        return Err(object_store::Error::Generic {
+                            store: "fail-delete",
+                            source: Box::new(std::io::Error::other(
+                                "injected cleanup delete failure",
+                            )),
+                        });
+                    }
+                    memory_store.delete(&location).await?;
+                    Ok(location)
+                }
+            }))
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.memory_store.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<ListResult> {
+            self.memory_store.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.memory_store.copy_opts(from, to, options).await
+        }
+    }
+
+    #[test]
+    fn prepared_snapshot_cleanup_surfaces_deletion_failures() {
+        futures::executor::block_on(async {
+            let table_url =
+                url::Url::parse("file:///tmp/snapshot-cleanup-failure/").expect("table URL");
+            let memory_store = Arc::new(object_store::memory::InMemory::new());
+            let store: Arc<dyn ObjectStore> = Arc::new(DeleteRejectingStore {
+                memory_store: Arc::clone(&memory_store),
+                rejected_suffix: "metadata/manifest.avro",
+            });
+            let store_ctx = StoreContext::new(store, &table_url).expect("store context");
+            let manifest = Path::from("metadata/manifest.avro");
+            let manifest_list = Path::from("metadata/snap.avro");
+            for path in [&manifest, &manifest_list] {
+                store_ctx
+                    .prefixed
+                    .put(path, PutPayload::from(Bytes::from_static(b"artifact")))
+                    .await
+                    .expect("write cleanup artifact");
+            }
+
+            let error =
+                cleanup_created_paths(&store_ctx, &[manifest.clone(), manifest_list.clone()])
+                    .await
+                    .expect_err("manifest cleanup failure must be surfaced");
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("injected cleanup delete failure")
+            );
+            store_ctx
+                .prefixed
+                .head(&manifest)
+                .await
+                .expect("failed deletion artifact is retained");
+            assert!(matches!(
+                store_ctx.prefixed.head(&manifest_list).await,
+                Err(object_store::Error::NotFound { .. })
+            ));
+        });
     }
 
     fn nullable_manifest_list_bytes(manifest_path: &str, manifest_length: i64) -> Vec<u8> {
@@ -1777,7 +1953,10 @@ mod tests {
                     .is_some()
             );
 
-            prepared_snapshot.cleanup().await;
+            prepared_snapshot
+                .cleanup()
+                .await
+                .expect("prepared snapshot cleanup");
 
             assert!(
                 memory_store

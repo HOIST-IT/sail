@@ -1000,6 +1000,11 @@ enum IcebergSnapshotUpdateKind {
   ICEBERG_SNAPSHOT_UPDATE_KIND_COPY_ON_WRITE_DELETE = 6;
 }
 
+message IcebergSnapshotProperty {
+  string key = 1;
+  string value = 2;
+}
+
 message IcebergCommitExecNode {
   bytes input = 1;
   string table_url = 2;
@@ -1011,6 +1016,10 @@ message IcebergCommitExecNode {
   IcebergSnapshotUpdateKind snapshot_update_kind = 6;
   bool dynamic_partition_overwrite = 7;
   repeated string removed_data_file_paths = 8;
+  repeated IcebergSnapshotProperty snapshot_properties = 9;
+  optional int64 caller_expected_snapshot_id = 10;
+  // Carries the real update kind when field 6 is the fail-closed controlled-write sentinel.
+  optional IcebergSnapshotUpdateKind controlled_snapshot_update_kind = 11;
 }
 
 message IcebergManifestScanExecNode {
