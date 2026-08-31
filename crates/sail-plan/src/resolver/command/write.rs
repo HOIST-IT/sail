@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::{Field, Schema};
@@ -201,6 +202,34 @@ impl WritePlanBuilder {
     }
 }
 
+fn has_direct_option(options: &[OptionLayer], expected_key: &str) -> bool {
+    options.iter().any(|layer| match layer {
+        OptionLayer::OptionList { items } => items
+            .iter()
+            .any(|(key, _)| key.eq_ignore_ascii_case(expected_key)),
+        _ => false,
+    })
+}
+
+async fn resolve_table_info_after_control_guard<T, F, Fut>(
+    mode: &WriteMode,
+    options: &[OptionLayer],
+    lookup: F,
+) -> PlanResult<T>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = PlanResult<T>>,
+{
+    if matches!(mode, WriteMode::ErrorIfExists | WriteMode::IgnoreIfExists)
+        && has_direct_option(options, "expected-snapshot-id")
+    {
+        return Err(PlanError::invalid(
+            "Iceberg write option `expected-snapshot-id` cannot be used with ErrorIfExists or IgnoreIfExists",
+        ));
+    }
+    lookup().await
+}
+
 impl PlanResolver<'_> {
     /// Builds a write logical plan and any catalog preconditions needed before executing it.
     pub(super) async fn resolve_write_with_builder(
@@ -286,7 +315,11 @@ impl PlanResolver<'_> {
                 table,
                 column_match,
             } => {
-                let info = self.resolve_table_info(&table).await?;
+                let info =
+                    resolve_table_info_after_control_guard(&mode, &sink_info.options, || {
+                        self.resolve_table_info(&table)
+                    })
+                    .await?;
 
                 // Return early if the target exists and the mode says to skip
                 if matches!(mode, WriteMode::IgnoreIfExists) && info.is_some() {
@@ -445,6 +478,8 @@ impl PlanResolver<'_> {
                                 .filter_map(|(k, v)| {
                                     if !k.eq_ignore_ascii_case("path")
                                         && !k.eq_ignore_ascii_case("location")
+                                        && !(write_format.eq_ignore_ascii_case("iceberg")
+                                            && Self::is_iceberg_commit_only_option(&k))
                                     {
                                         Some((format!("option.{k}"), v))
                                     } else {
@@ -1630,6 +1665,13 @@ impl PlanResolver<'_> {
             _ => false,
         })
     }
+
+    fn is_iceberg_commit_only_option(key: &str) -> bool {
+        key.eq_ignore_ascii_case("expected-snapshot-id")
+            || key
+                .get(.."snapshot-property.".len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("snapshot-property."))
+    }
 }
 
 fn resolve_partition_transform_function(
@@ -1862,5 +1904,58 @@ impl TableInfo {
             }
         };
         bucket_by_match && sort_by_match
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+
+    #[test]
+    fn ignored_write_modes_reject_expected_snapshot_before_catalog_lookup() {
+        for mode in [WriteMode::ErrorIfExists, WriteMode::IgnoreIfExists] {
+            let lookup_called = AtomicBool::new(false);
+            let options = vec![OptionLayer::OptionList {
+                items: vec![("EXPECTED-SNAPSHOT-ID".to_string(), "17".to_string())],
+            }];
+
+            let error = futures::executor::block_on(resolve_table_info_after_control_guard(
+                &mode,
+                &options,
+                || {
+                    lookup_called.store(true, Ordering::SeqCst);
+                    async { Ok::<_, PlanError>(()) }
+                },
+            ))
+            .expect_err("ignored controlled write must fail");
+
+            assert!(error.to_string().contains("expected-snapshot-id"));
+            assert!(!lookup_called.load(Ordering::SeqCst));
+        }
+    }
+
+    #[test]
+    fn nonignored_write_mode_reaches_catalog_lookup_spy() {
+        let lookup_called = AtomicBool::new(false);
+        let options = vec![OptionLayer::OptionList {
+            items: vec![("expected-snapshot-id".to_string(), "17".to_string())],
+        }];
+
+        let result = futures::executor::block_on(resolve_table_info_after_control_guard(
+            &WriteMode::Append {
+                error_if_absent: false,
+            },
+            &options,
+            || {
+                lookup_called.store(true, Ordering::SeqCst);
+                async { Ok::<_, PlanError>("catalog-result") }
+            },
+        ))
+        .expect("append lookup result");
+
+        assert_eq!(result, "catalog-result");
+        assert!(lookup_called.load(Ordering::SeqCst));
     }
 }

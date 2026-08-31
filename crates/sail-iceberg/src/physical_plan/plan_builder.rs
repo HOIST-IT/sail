@@ -43,6 +43,8 @@ pub struct IcebergPlanBuilder<'a> {
     sink_mode: PhysicalSinkMode,
     sort_order: Option<Vec<PhysicalSortExpr>>,
     expected_snapshot_id: Option<Option<i64>>,
+    caller_expected_snapshot_id: Option<i64>,
+    snapshot_properties: Vec<(String, String)>,
     removed_data_file_paths: Vec<String>,
     dynamic_partition_overwrite: bool,
     snapshot_update_kind: Option<SnapshotUpdateKind>,
@@ -64,6 +66,8 @@ impl<'a> IcebergPlanBuilder<'a> {
             sink_mode,
             sort_order,
             expected_snapshot_id: None,
+            caller_expected_snapshot_id: None,
+            snapshot_properties: Vec::new(),
             removed_data_file_paths: Vec::new(),
             dynamic_partition_overwrite: false,
             snapshot_update_kind: None,
@@ -73,6 +77,16 @@ impl<'a> IcebergPlanBuilder<'a> {
 
     pub fn with_expected_snapshot_id(mut self, expected_snapshot_id: Option<Option<i64>>) -> Self {
         self.expected_snapshot_id = expected_snapshot_id;
+        self
+    }
+
+    pub fn with_caller_expected_snapshot_id(mut self, snapshot_id: Option<i64>) -> Self {
+        self.caller_expected_snapshot_id = snapshot_id;
+        self
+    }
+
+    pub fn with_snapshot_properties(mut self, properties: Vec<(String, String)>) -> Self {
+        self.snapshot_properties = properties;
         self
     }
 
@@ -199,6 +213,8 @@ impl<'a> IcebergPlanBuilder<'a> {
                 snapshot_update_kind,
             )
             .with_expected_snapshot_id(self.expected_snapshot_id)
+            .with_caller_expected_snapshot_id(self.caller_expected_snapshot_id)
+            .with_snapshot_properties(self.snapshot_properties.clone())
             .with_removed_data_file_paths(self.removed_data_file_paths.clone())
             .with_dynamic_partition_overwrite(self.dynamic_partition_overwrite),
         ))
