@@ -1361,7 +1361,8 @@ mod tests {
     #[test]
     fn prepared_snapshot_cleanup_surfaces_deletion_failures() {
         futures::executor::block_on(async {
-            let table_url = Url::parse("file:///tmp/snapshot-cleanup-failure/").expect("table URL");
+            let table_url =
+                url::Url::parse("file:///tmp/snapshot-cleanup-failure/").expect("table URL");
             let memory_store = Arc::new(object_store::memory::InMemory::new());
             let store: Arc<dyn ObjectStore> = Arc::new(DeleteRejectingStore {
                 memory_store: Arc::clone(&memory_store),
