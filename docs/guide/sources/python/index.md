@@ -12,6 +12,34 @@ You can define a Python class that inherits from the `pyspark.sql.datasource.Dat
 
 Currently, Sail supports Python data sources for batch reading and writing.
 
+## Classified Reader Failures
+
+By default, Sail propagates a Python data source exception with its Python
+traceback. A data source can instead declare a finite failure category when its
+caller must distinguish a deterministic failure from a retryable one without
+inspecting exception text. Define `__sail_data_source_failure_kind__` on the
+exception class with one of these exact values:
+
+- `"terminal"` becomes a Spark `AnalysisException`.
+- `"transient"` becomes a Spark `SparkRuntimeException`.
+
+For a declared failure, Sail replaces the Python message and traceback with a
+constant category message before the error crosses Spark Connect. Unknown
+values retain the default exception behavior.
+
+```python
+class RetryableReadError(TimeoutError):
+    __sail_data_source_failure_kind__ = "transient"
+
+
+class ContractReadError(ValueError):
+    __sail_data_source_failure_kind__ = "terminal"
+```
+
+Use this protocol only for data-source-controlled exception classes. Do not put
+record values, credentials, endpoints, or other runtime details in the category
+attribute.
+
 ## Examples
 
 <!--@include: ../../_common/spark-session.md-->

@@ -14,10 +14,37 @@ pub struct RemoteError {
     pub cause: CommonErrorCause,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PythonFailureKind {
+    Terminal,
+    Transient,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum PythonDataSourceFailure {
+    #[error("Python data source reported a terminal failure")]
+    Terminal,
+    #[error("Python data source reported a transient failure")]
+    Transient,
+}
+
+impl PythonDataSourceFailure {
+    pub fn kind(self) -> PythonFailureKind {
+        match self {
+            Self::Terminal => PythonFailureKind::Terminal,
+            Self::Transient => PythonFailureKind::Transient,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PythonErrorCause {
     pub summary: String,
     pub traceback: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_kind: Option<PythonFailureKind>,
 }
 
 /// A trait to extract Python error cause from a generic error.
@@ -166,6 +193,14 @@ impl CommonErrorCause {
             };
         }
 
+        if let Some(failure) = error.downcast_ref::<PythonDataSourceFailure>() {
+            return Self::Python(PythonErrorCause {
+                summary: failure.to_string(),
+                traceback: None,
+                failure_kind: Some(failure.kind()),
+            });
+        }
+
         if let Some(cause) = Py::extract(error) {
             return Self::Python(cause);
         }
@@ -185,5 +220,39 @@ impl CommonErrorCause {
     /// from the innermost error.
     pub fn new<Py: PythonErrorCauseExtractor>(error: &(dyn std::error::Error + 'static)) -> Self {
         Self::build::<Py>(error, &mut HashSet::new())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_python_failure_kind_round_trips() -> Result<(), Box<dyn std::error::Error>> {
+        let cause = CommonErrorCause::Python(PythonErrorCause {
+            summary: "Python data source reported a terminal failure".to_string(),
+            traceback: None,
+            failure_kind: Some(PythonFailureKind::Terminal),
+        });
+
+        let encoded = serde_json::to_string(&cause)?;
+        assert!(encoded.contains(r#""failureKind":"terminal""#));
+        let decoded: CommonErrorCause = serde_json::from_str(&encoded)?;
+        let CommonErrorCause::Python(decoded) = decoded else {
+            return Err(std::io::Error::other("expected Python error cause").into());
+        };
+        assert_eq!(decoded.failure_kind, Some(PythonFailureKind::Terminal));
+        Ok(())
+    }
+
+    #[test]
+    fn test_legacy_python_cause_defaults_failure_kind() -> Result<(), Box<dyn std::error::Error>> {
+        let encoded = r#"{"python":{"summary":"legacy","traceback":null}}"#;
+        let decoded: CommonErrorCause = serde_json::from_str(encoded)?;
+        let CommonErrorCause::Python(decoded) = decoded else {
+            return Err(std::io::Error::other("expected Python error cause").into());
+        };
+        assert_eq!(decoded.failure_kind, None);
+        Ok(())
     }
 }
