@@ -19,6 +19,7 @@
 
 pub mod values;
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 use std::ops::Index;
@@ -343,6 +344,24 @@ impl PrimitiveType {
         )
     }
 
+    /// Return a literal that uses this type's representation, applying Iceberg's
+    /// supported primitive promotions when necessary.
+    pub(crate) fn promote_literal<'a>(
+        &self,
+        literal: &'a PrimitiveLiteral,
+    ) -> Option<Cow<'a, PrimitiveLiteral>> {
+        match (self, literal) {
+            (PrimitiveType::Long, PrimitiveLiteral::Int(value)) => {
+                Some(Cow::Owned(PrimitiveLiteral::Long(i64::from(*value))))
+            }
+            (PrimitiveType::Double, PrimitiveLiteral::Float(value)) => Some(Cow::Owned(
+                PrimitiveLiteral::Double(OrderedFloat(f64::from(value.into_inner()))),
+            )),
+            (_, literal) if self.compatible(literal) => Some(Cow::Borrowed(literal)),
+            _ => None,
+        }
+    }
+
     /// Decode a PrimitiveLiteral from the serialized bound bytes that appear in manifests.
     pub fn literal_from_bytes(&self, bytes: &[u8]) -> Result<PrimitiveLiteral, String> {
         use crate::spec::types::values::PrimitiveLiteral as PL;
@@ -412,12 +431,10 @@ impl PrimitiveType {
                 PL::String(val)
             }
             PrimitiveType::Uuid => {
-                let value = u128::from_be_bytes(
-                    bytes
-                        .try_into()
-                        .map_err(|_| "Invalid 16-byte UUID bound".to_string())?,
-                );
-                PL::UInt128(value)
+                let bytes: [u8; 16] = bytes
+                    .try_into()
+                    .map_err(|_| "Invalid UUID bound bytes".to_string())?;
+                PL::UInt128(u128::from_be_bytes(bytes))
             }
             PrimitiveType::Fixed(_)
             | PrimitiveType::Binary
@@ -427,14 +444,13 @@ impl PrimitiveType {
                 return Err("variant bound decoding not supported".to_string());
             }
             PrimitiveType::Decimal { .. } => {
-                if bytes.is_empty() || bytes.len() > size_of::<i128>() {
-                    return Err("Invalid signed decimal bound bytes".to_string());
+                if bytes.is_empty() || bytes.len() > 16 {
+                    return Err("Invalid decimal bound bytes".to_string());
                 }
-                let fill = if bytes[0] & 0x80 == 0 { 0 } else { u8::MAX };
-                let mut value = [fill; size_of::<i128>()];
-                let offset = value.len() - bytes.len();
-                value[offset..].copy_from_slice(bytes);
-                PL::Int128(i128::from_be_bytes(value))
+                let sign_extension = if bytes[0] & 0x80 == 0 { 0 } else { u8::MAX };
+                let mut extended = [sign_extension; 16];
+                extended[16 - bytes.len()..].copy_from_slice(bytes);
+                PL::Int128(i128::from_be_bytes(extended))
             }
             PrimitiveType::Unknown => {
                 return Err("unknown bound decoding is only valid for null values".to_string());

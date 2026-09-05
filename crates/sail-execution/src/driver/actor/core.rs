@@ -12,6 +12,7 @@ use sail_common::actor::{Actor, ActorAction, ActorContext};
 use crate::driver::job_scheduler::{JobScheduler, JobSchedulerOptions};
 use crate::driver::task_assigner::{TaskAssigner, TaskAssignerOptions};
 use crate::driver::worker_pool::{WorkerPool, WorkerPoolOptions};
+use crate::driver::worker_scaler::{WorkerScaler, WorkerScalerOptions};
 use crate::driver::{DriverActor, DriverComponents, DriverMessage, DriverOptions};
 use crate::shuffle::{ShuffleBackendKind, celeborn_application_id};
 use crate::stream::celeborn::CelebornStreamManager;
@@ -22,7 +23,6 @@ use crate::task_runner::{
     TaskRunnerPlacement,
 };
 
-#[tonic::async_trait]
 impl Actor for DriverActor {
     type Message = DriverMessage;
     type Options = (DriverOptions, DriverComponents);
@@ -35,19 +35,25 @@ impl Actor for DriverActor {
         let (options, components) = options;
         let DriverComponents {
             worker_manager,
-            history_reporter,
+            event_reporter,
         } = components;
-        let worker_pool = WorkerPool::new(worker_manager, WorkerPoolOptions::from(&options));
-        let job_scheduler = JobScheduler::new(JobSchedulerOptions::from(&options));
+        let worker_pool = WorkerPool::new(
+            worker_manager,
+            WorkerPoolOptions::from(&options),
+            event_reporter.clone(),
+        );
+        let job_scheduler = JobScheduler::new(JobSchedulerOptions::from(&options), event_reporter);
         let task_assigner = TaskAssigner::new(TaskAssignerOptions::from(&options));
+        let worker_scaler = WorkerScaler::new(WorkerScalerOptions::from(&options));
         Self {
             options,
-            history_reporter,
             worker_pool,
             job_scheduler,
             task_assigner,
+            worker_scaler,
             task_runner: None,
             extensions: Default::default(),
+            activated: false,
             task_sequences: HashMap::new(),
             shutdown_notifier: None,
         }
@@ -71,8 +77,7 @@ impl Actor for DriverActor {
         };
         let celeborn_streams = match &self.options.shuffle_backend {
             ShuffleBackendKind::Celeborn {
-                master_host,
-                master_port,
+                master_endpoints,
                 compression,
                 heartbeat_interval_secs,
                 partition_split_threshold,
@@ -82,7 +87,7 @@ impl Actor for DriverActor {
                 let application_id = celeborn_application_id(&self.options.session_id);
                 let options = LifecycleManagerOptions::new(
                     application_id.clone(),
-                    MasterClientOptions::new(master_host.clone(), *master_port),
+                    MasterClientOptions::new(master_endpoints.clone()),
                 );
                 let options = match self.options.shuffle_backend.celeborn_endpoint_resolver() {
                     Some(endpoint_resolver) => options.with_endpoint_resolver(endpoint_resolver),
@@ -111,6 +116,7 @@ impl Actor for DriverActor {
         };
         self.task_runner = Some(ctx.children_mut().spawn::<TaskRunnerActor>(
             TaskRunnerComponents {
+                session_id: self.options.session_id.clone(),
                 extensions: TaskRunnerExtensions {
                     local_streams,
                     storage_streams,
@@ -121,9 +127,13 @@ impl Actor for DriverActor {
         ));
     }
 
-    fn receive(&mut self, ctx: &mut ActorContext<Self>, message: DriverMessage) -> ActorAction {
+    async fn receive(
+        &mut self,
+        ctx: &mut ActorContext<Self>,
+        message: DriverMessage,
+    ) -> ActorAction {
         match message {
-            DriverMessage::Activate => self.handle_activate(ctx),
+            DriverMessage::Activate { result } => self.handle_activate(ctx, result),
             DriverMessage::RegisterWorker {
                 worker_id,
                 host,
@@ -140,6 +150,12 @@ impl Actor for DriverActor {
             DriverMessage::ProbePendingWorker { worker_id } => {
                 self.handle_probe_pending_worker(ctx, worker_id)
             }
+            DriverMessage::WorkerFailedToStart { worker_id, message } => {
+                self.handle_worker_failed_to_start(ctx, worker_id, message)
+            }
+            DriverMessage::RetryWorkerDemand { request } => {
+                self.handle_retry_worker_demand(ctx, request)
+            }
             DriverMessage::ProbeIdleWorker { worker_id, instant } => {
                 self.handle_probe_idle_worker(ctx, worker_id, instant)
             }
@@ -151,7 +167,9 @@ impl Actor for DriverActor {
                 context,
                 result,
             } => self.handle_execute_job(ctx, plan, context, result),
-            DriverMessage::CleanUpJob { job_id } => self.handle_clean_up_job(ctx, job_id),
+            DriverMessage::CleanUpJob { job_id, outcome } => {
+                self.handle_clean_up_job(ctx, job_id, outcome)
+            }
             DriverMessage::UpdateTask {
                 key,
                 status,
@@ -172,7 +190,6 @@ impl Actor for DriverActor {
             DriverMessage::CelebornGetLifecycleManager { result } => {
                 self.handle_celeborn_get_lifecycle_manager(result)
             }
-            DriverMessage::ObserveState { observer } => self.handle_observe_state(ctx, observer),
             DriverMessage::Shutdown { result } => self.handle_shutdown(ctx, result),
         }
     }
@@ -189,8 +206,6 @@ impl Actor for DriverActor {
             let _ = lifecycle_manager.stop().await;
         }
         ctx.children_mut().join().await;
-        let history = self.build_history();
-        self.history_reporter.report(history).await;
         if let Some(result) = self.shutdown_notifier.take() {
             let _ = result.send(());
         }

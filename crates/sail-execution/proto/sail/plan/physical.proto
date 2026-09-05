@@ -145,6 +145,8 @@ message HigherOrderUdf {
     SparkArrayForallUdf forall = 4;
     SparkArrayAggregateUdf aggregate = 5;
     SparkArraySortUdf sort = 6;
+    SparkSequenceUdf spark_sequence_lazy = 7;
+    ConvertTzUdf convert_tz_lazy = 8;
   }
 }
 
@@ -229,6 +231,7 @@ message ExtendedScalarUdf {
     SparkMapFromArraysUdf spark_map_from_arrays = 37;
     SparkMapFromEntriesUdf spark_map_from_entries = 38;
     StrToMapUdf str_to_map = 39;
+    SparkSequenceUdf spark_sequence = 40;
   }
 }
 
@@ -299,6 +302,11 @@ message SparkFromXmlUdf {
 }
 
 message SparkUnixTimestampUdf {
+  string session_timezone = 1;
+  bool ansi_mode = 2;
+}
+
+message SparkSequenceUdf {
   string session_timezone = 1;
   bool ansi_mode = 2;
 }
@@ -428,6 +436,7 @@ message SparkMakeTimestampNtzUdf {
 
 message ConvertTzUdf {
   bool classic = 1;
+  bool null_short_circuit = 2;
 }
 
 message StandardUdaf {}
@@ -734,6 +743,13 @@ message PartitionedTopKExecNode {
   LexOrdering expr = 1;
   uint64 partition_prefix_len = 2;
   uint64 fetch = 3;
+  PartitionedTopKWindowFnKind window_fn_kind = 4;
+}
+
+enum PartitionedTopKWindowFnKind {
+  PARTITIONED_TOP_K_WINDOW_FN_KIND_UNSPECIFIED = 0;
+  PARTITIONED_TOP_K_WINDOW_FN_KIND_ROW_NUMBER = 1;
+  PARTITIONED_TOP_K_WINDOW_FN_KIND_RANK = 2;
 }
 
 message AppendMode {}
@@ -829,8 +845,6 @@ message DeltaScanByAddsExecNode {
 
 message DeltaDiscoveryExecNode {
   string table_url = 1;
-  optional bytes predicate = 2;
-  optional bytes table_schema = 3;
   int64 version = 4;
   optional bytes input = 5;
   repeated string input_partition_columns = 6;
@@ -1096,6 +1110,13 @@ message DeletionVectorWriterExecNode {
   optional string partition_value_columns_json = 7;
 }
 
+enum DeletionVectorRowOperationMode {
+  DELETION_VECTOR_ROW_OPERATION_MODE_UNSPECIFIED = 0;
+  DELETION_VECTOR_ROW_OPERATION_MODE_UPDATE = 1;
+  DELETION_VECTOR_ROW_OPERATION_MODE_DELETE = 2;
+  DELETION_VECTOR_ROW_OPERATION_MODE_MIXED = 3;
+}
+
 message DeletionVectorRowsWriterExecNode {
   bytes input = 1;
   string table_url = 2;
@@ -1105,6 +1126,7 @@ message DeletionVectorRowsWriterExecNode {
   optional string operation_json = 6;
   bytes adds_input = 7;
   optional string partition_value_columns_json = 8;
+  DeletionVectorRowOperationMode operation_mode = 9;
 }
 
 message PythonDataSourceInputPartition {

@@ -38,12 +38,13 @@ use datafusion::physical_expr::expressions::{
     BinaryExpr as PhysicalBinaryExpr, Column, Literal as PhysicalLiteral,
 };
 use datafusion::physical_expr_adapter::PhysicalExprAdapterFactory;
-use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::limit::GlobalLimitExec;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::union::UnionExec;
+use datafusion::physical_plan::{ExecutionPlan, Partitioning};
+use datafusion_datasource::file_scan_config::output_partitioning_from_partition_fields;
 use object_store::ObjectMeta;
 use sail_common_datafusion::catalog::CatalogPartitionField;
 use sail_common_datafusion::datasource::PhysicalSinkMode;
@@ -383,14 +384,14 @@ impl IcebergTableProvider {
                     let scalar = self
                         .schema
                         .field_by_name(arrow_field.name())
-                        .and_then(|field| identity_fields.get(&field.id).copied())
-                        .and_then(|index| file.partition.get(index))
-                        .and_then(Option::as_ref)
-                        .and_then(|literal| match literal {
-                            Literal::Primitive(value) => Some(primitive_to_scalar_default(value)),
-                            _ => None,
+                        .and_then(|field| {
+                            identity_fields
+                                .get(&field.id)
+                                .copied()
+                                .and_then(|index| file.partition.get(index))
+                                .and_then(Option::as_ref)
+                                .map(|literal| to_scalar(literal, &field.field_type))
                         })
-                        .map(Ok)
                         .unwrap_or_else(|| ScalarValue::try_from(arrow_field.data_type()));
                     scalar?.to_array_of_size(1)
                 })
@@ -777,6 +778,7 @@ impl IcebergTableProvider {
                 extensions: Default::default(),
                 metadata_size_hint: None,
                 table_reference: None,
+                arrow_schema: None,
             };
 
             partitioned_files.push(partitioned_file);
@@ -874,9 +876,8 @@ impl IcebergTableProvider {
             global: session.config().options().execution.parquet.clone(),
             ..Default::default()
         };
-        let table_schema = TableSchema::new(
-            self.arrow_schema.clone(),
-            vec![
+        let table_schema = TableSchema::builder(self.arrow_schema.clone())
+            .with_table_partition_cols(vec![
                 Arc::new(Field::new(file_column_name, DataType::Utf8, false)),
                 Arc::new(Field::new(
                     MERGE_PARTITION_SPEC_ID_COLUMN,
@@ -884,8 +885,8 @@ impl IcebergTableProvider {
                     false,
                 )),
                 Arc::new(Field::new(MERGE_PARTITION_COLUMN, DataType::Utf8, false)),
-            ],
-        );
+            ])
+            .build();
         Arc::new(ParquetSource::new(table_schema).with_table_parquet_options(parquet_options))
     }
 
@@ -1300,7 +1301,7 @@ impl TableProvider for IcebergTableProvider {
                 FileScanConfigBuilder::new(object_store_url.clone(), parquet_source)
                     .with_file_groups(vec![FileGroup::from(partitioned)])
                     // Position deletes require the original file order and absolute offsets.
-                    .with_partitioned_by_file_group(true)
+                    .with_output_partitioning(Some(Partitioning::UnknownPartitioning(1)))
                     .with_preserve_order(true)
                     .with_expr_adapter(Some(iceberg_schema_evolution_adapter()))
                     .build();
@@ -1480,13 +1481,19 @@ impl IcebergTableProvider {
                 .collect::<Vec<_>>();
             let parquet_source =
                 self.build_merge_parquet_source(session, file_column_name.as_str());
+            let output_partitioning = output_partitioning_from_partition_fields(
+                parquet_source.table_schema().table_schema(),
+                parquet_source.table_schema().table_partition_cols(),
+                file_groups.len(),
+            )
+            .unwrap_or_else(|| Partitioning::UnknownPartitioning(file_groups.len()));
             let file_scan_config =
                 FileScanConfigBuilder::new(object_store_url.clone(), parquet_source)
                     .with_file_groups(file_groups)
                     // MERGE synthesizes file-local row positions before applying filters.
                     // Keep every file group whole so DataFusion cannot split a Parquet file
                     // into byte ranges whose streams would each start at position zero.
-                    .with_partitioned_by_file_group(true)
+                    .with_output_partitioning(Some(output_partitioning))
                     .with_preserve_order(true)
                     .with_expr_adapter(Some(iceberg_schema_evolution_adapter()))
                     .build();
@@ -1508,7 +1515,7 @@ impl IcebergTableProvider {
                     .with_file_groups(vec![FileGroup::from(partitioned)])
                     // Existing position deletes and MERGE row positions both require the
                     // original file order and absolute offsets.
-                    .with_partitioned_by_file_group(true)
+                    .with_output_partitioning(Some(Partitioning::UnknownPartitioning(1)))
                     .with_preserve_order(true)
                     .with_expr_adapter(Some(iceberg_schema_evolution_adapter()))
                     .build();

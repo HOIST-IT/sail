@@ -21,7 +21,7 @@ use datafusion::common::pruning::PruningStatistics;
 use datafusion::common::{Column, Result, ToDFSchema};
 use datafusion::logical_expr::utils::conjunction;
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
-use datafusion::physical_optimizer::pruning::PruningPredicate;
+use datafusion::physical_optimizer::pruning::PruningPredicateBuilder;
 
 use crate::spec::partition::PartitionSpec;
 use crate::spec::transform::Transform;
@@ -239,7 +239,9 @@ pub fn prune_files(
     let files_to_keep = if let Some(predicate) = &filter_expr {
         let df_schema = logical_schema.clone().to_dfschema()?;
         let physical_predicate = session.create_physical_expr(predicate.clone(), &df_schema)?;
-        let pruning_predicate = PruningPredicate::try_new(physical_predicate, logical_schema)?;
+        let pruning_predicate = PruningPredicateBuilder::new()
+            .with_file_schema(logical_schema)
+            .try_build(physical_predicate)?;
         pruning_predicate.prune(&stats)?
     } else {
         vec![true; stats.num_containers()]
@@ -387,7 +389,7 @@ fn collect_source_eq_filters(schema: &Schema, filters: &[Expr]) -> Vec<(i32, Pri
                 {
                     let col_name = c.name.clone();
                     if let Some(field) = schema.field_by_name(&col_name)
-                        && let Ok(pl) = scalar_to_primitive_literal(sv)
+                        && let Ok(pl) = scalar_to_primitive_literal(sv, field.field_type.as_ref())
                     {
                         acc.push((field.id, pl));
                         return;
@@ -400,7 +402,7 @@ fn collect_source_eq_filters(schema: &Schema, filters: &[Expr]) -> Vec<(i32, Pri
                 {
                     let col_name = c.name.clone();
                     if let Some(field) = schema.field_by_name(&col_name)
-                        && let Ok(pl) = scalar_to_primitive_literal(sv)
+                        && let Ok(pl) = scalar_to_primitive_literal(sv, field.field_type.as_ref())
                     {
                         acc.push((field.id, pl));
                     }
@@ -444,7 +446,8 @@ fn collect_source_in_filters(
                     let mut vals = Vec::new();
                     for item in &in_list.list {
                         if let Expr::Literal(sv, _) = item
-                            && let Ok(pl) = scalar_to_primitive_literal(sv)
+                            && let Ok(pl) =
+                                scalar_to_primitive_literal(sv, field.field_type.as_ref())
                         {
                             vals.push(pl);
                         }
@@ -563,6 +566,10 @@ fn transform_primitive_literal(
     source_type: &Type,
     literal: PrimitiveLiteral,
 ) -> Option<PrimitiveLiteral> {
+    let literal = source_type
+        .as_primitive_type()?
+        .promote_literal(&literal)?
+        .into_owned();
     match apply_transform(transform, source_type, Some(Literal::Primitive(literal))) {
         Some(Literal::Primitive(value)) => Some(value),
         _ => None,
@@ -772,7 +779,7 @@ fn collect_source_range_filters(
         inclusive: bool,
     ) {
         if let Some(field) = schema.field_by_name(column_name)
-            && let Ok(pl) = scalar_to_primitive_literal(literal)
+            && let Ok(pl) = scalar_to_primitive_literal(literal, field.field_type.as_ref())
         {
             let entry = acc.entry(field.id).or_default();
             tighten_min(&mut entry.min, (pl, inclusive));
@@ -787,7 +794,7 @@ fn collect_source_range_filters(
         inclusive: bool,
     ) {
         if let Some(field) = schema.field_by_name(column_name)
-            && let Ok(pl) = scalar_to_primitive_literal(literal)
+            && let Ok(pl) = scalar_to_primitive_literal(literal, field.field_type.as_ref())
         {
             let entry = acc.entry(field.id).or_default();
             tighten_max(&mut entry.max, (pl, inclusive));
