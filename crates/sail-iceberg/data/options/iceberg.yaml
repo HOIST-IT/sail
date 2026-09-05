@@ -89,6 +89,24 @@
 
 ### Write-Only Options ###
 
+- key: caller_expected_snapshot_id
+  description: |
+    Require the current Iceberg table snapshot to equal this positive snapshot id before
+    committing the write. The expectation is retained independently from Sail's internal
+    read-snapshot validation.
+  default:
+    value: ""
+    parser: crate::snapshot_properties::parse_optional_expected_snapshot_id
+  supported: true
+  rust_type: "Option<i64>"
+  scopes:
+    - write
+  origins:
+    - type: option
+      keys:
+        - expected-snapshot-id
+      parser: crate::snapshot_properties::parse_expected_snapshot_id
+
 - key: overwrite_schema
   description: |
     If `true`, allows overwriting the schema of the table when using overwrite mode.

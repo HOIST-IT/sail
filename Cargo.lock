@@ -7949,6 +7949,7 @@ dependencies = [
  "rust_decimal",
  "sail-build-scripts",
  "sail-catalog",
+ "sail-catalog-memory",
  "sail-common",
  "sail-common-datafusion",
  "sail-data-source",

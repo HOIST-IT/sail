@@ -60,6 +60,7 @@ use crate::physical_plan::write_context::{
     input_schema_with_logical_metadata, prepare_iceberg_write_context,
 };
 use crate::schema_evolution::SchemaEvolver;
+use crate::snapshot_properties::extract_snapshot_properties;
 use crate::spec::{FormatVersion, MetadataLog, PartitionSpec, Schema, Snapshot, TableMetadata};
 use crate::table::metadata_loader::{
     encode_metadata_file, load_metadata_file_bytes, metadata_file_extension_from_properties,
@@ -491,11 +492,23 @@ pub(crate) async fn plan_iceberg_write(
     validate_iceberg_lakehouse_storage_access(lakehouse_table.as_ref())?;
     let metadata_location = metadata_location_from_options(&options);
     let catalog_managed_table = catalog_managed_iceberg_from_options(&options);
+    let (options, snapshot_properties) = extract_snapshot_properties(options)?;
     let (clean_options, table_properties) =
         split_iceberg_write_options_and_table_properties(options)?;
     let variant_shredding_option_presence =
         IcebergWriterExecOptions::variant_shredding_option_presence(&clean_options);
     let iceberg_options = IcebergWriteOptions::resolve(ctx, clean_options)?;
+    let caller_expected_snapshot_id = iceberg_options.caller_expected_snapshot_id;
+    if caller_expected_snapshot_id.is_some()
+        && matches!(
+            &mode,
+            PhysicalSinkMode::ErrorIfExists | PhysicalSinkMode::IgnoreIfExists
+        )
+    {
+        return plan_err!(
+            "Iceberg write option `expected-snapshot-id` cannot be used with ErrorIfExists or IgnoreIfExists"
+        );
+    }
 
     let sort_order = create_sort_order(ctx, sort_order, logical_input.schema())?;
     let physical_sort = sort_order.map(|req| {
@@ -540,6 +553,20 @@ pub(crate) async fn plan_iceberg_write(
     } else {
         None
     };
+    if let Some(expected_snapshot_id) = caller_expected_snapshot_id {
+        let current_snapshot_id = table
+            .as_ref()
+            .and_then(|table| table.metadata().current_snapshot())
+            .map(Snapshot::snapshot_id);
+        if current_snapshot_id != Some(expected_snapshot_id) {
+            let current_snapshot_id = current_snapshot_id
+                .map(|snapshot_id| snapshot_id.to_string())
+                .unwrap_or_else(|| "none".to_string());
+            return plan_err!(
+                "Iceberg expected snapshot {expected_snapshot_id} does not match current snapshot {current_snapshot_id}"
+            );
+        }
+    }
     let existing_partition_columns = table
         .as_ref()
         .map(IcebergLakeSource::partition_columns_from_metadata)
@@ -635,7 +662,9 @@ pub(crate) async fn plan_iceberg_write(
         mode.clone(),
         physical_sort,
         ctx,
-    );
+    )
+    .with_caller_expected_snapshot_id(caller_expected_snapshot_id)
+    .with_snapshot_properties(snapshot_properties);
     if matches!(mode, PhysicalSinkMode::OverwriteIf { .. }) {
         builder = builder
             .with_expected_snapshot_id(expected_snapshot_id)

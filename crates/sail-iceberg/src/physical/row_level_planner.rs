@@ -15,7 +15,7 @@ use crate::lake_source::{
     resolve_iceberg_metadata_location, split_iceberg_write_options_and_table_properties,
 };
 use crate::operations::SnapshotUpdateKind;
-use crate::options::r#gen::IcebergWriteOptions;
+use crate::options::r#gen::{IcebergReadOptions, IcebergWriteOptions};
 use crate::physical_plan::equality_delete_writer_exec::validate_equality_delete_schema;
 use crate::physical_plan::merge_row_projection::IcebergMergeRowProjection;
 use crate::physical_plan::{
@@ -106,13 +106,6 @@ async fn plan_iceberg_delete(
     planner: &dyn PhysicalPlanner,
     node: &RowLevelWriteNode,
 ) -> Result<Arc<dyn ExecutionPlan>> {
-    // TODO: Support conditionless DELETE by scanning all rows into equality deletes.
-    let condition = node.condition().ok_or_else(|| {
-        DataFusionError::Plan(
-            "Iceberg equality-delete MOR DELETE requires a WHERE condition".to_string(),
-        )
-    })?;
-
     let table_url =
         IcebergLakeSource::parse_table_url(vec![node.target_location().to_string()]).await?;
     let metadata_location = metadata_location_from_options(node.target_options());
@@ -125,21 +118,65 @@ async fn plan_iceberg_delete(
     let table =
         Table::load_with_metadata_location(session, table_url.clone(), metadata_location_for_load)
             .await?;
-    ensure_current_row_level_mode(&table, RowLevelCommand::Delete)?;
+
+    let writer_options = resolve_row_level_writer_options(session, node)?;
+    let partition_columns = IcebergLakeSource::partition_columns_from_metadata(&table)?;
     let current_schema = table.metadata().current_schema().ok_or_else(|| {
         DataFusionError::Plan("Iceberg table metadata is missing current schema".to_string())
     })?;
-    validate_equality_delete_schema(current_schema)?;
+    let current_arrow_schema =
+        crate::datasource::type_converter::iceberg_schema_to_arrow(current_schema)?;
+    let delete_mode = table
+        .metadata()
+        .properties
+        .get("write.delete.mode")
+        .map_or("copy-on-write", String::as_str);
 
+    if delete_mode.eq_ignore_ascii_case("copy-on-write") {
+        let condition = node.condition().cloned();
+        let sink_mode = PhysicalSinkMode::OverwriteIf {
+            source: condition
+                .as_ref()
+                .and_then(|condition| condition.source.clone()),
+            condition: condition.clone().map(Box::new),
+        };
+        let write_context = prepare_iceberg_write_context(
+            &table_url,
+            Some(table.metadata()),
+            &writer_options,
+            &partition_columns,
+            &sink_mode,
+            &current_arrow_schema,
+        )?;
+        let read_options = IcebergReadOptions::resolve(session, node.target_options().to_vec())?;
+        let provider = table.to_provider(&read_options)?;
+        return provider
+            .build_cow_delete_plan(
+                session,
+                condition,
+                writer_options,
+                partition_columns,
+                write_context,
+                node.expected_snapshot_id(),
+            )
+            .await;
+    }
+
+    ensure_current_row_level_mode(&table, RowLevelCommand::Delete)?;
+    // Equality-delete key validation applies to the merge-on-read fallback only.
+    // Copy-on-write rewrites whole data files and writes no equality-delete keys,
+    // so validating on the copy-on-write path would reject legitimate deletes on
+    // tables carrying float, double, nested or otherwise non-key-eligible columns.
+    validate_equality_delete_schema(current_schema)?;
+    let condition = node.condition().ok_or_else(|| {
+        DataFusionError::Plan(
+            "Iceberg equality-delete MOR DELETE requires a WHERE condition".to_string(),
+        )
+    })?;
     let delete_plan = LogicalPlanBuilder::from(node.raw_target().as_ref().clone())
         .filter(condition.expr.clone())?
         .build()?;
     let physical_delete = planner.create_physical_plan(&delete_plan, session).await?;
-
-    let writer_options = resolve_row_level_writer_options(session, node)?;
-    let partition_columns = IcebergLakeSource::partition_columns_from_metadata(&table)?;
-    let current_arrow_schema =
-        crate::datasource::type_converter::iceberg_schema_to_arrow(current_schema)?;
     let write_context = prepare_iceberg_write_context(
         &table_url,
         Some(table.metadata()),

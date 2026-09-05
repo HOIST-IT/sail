@@ -65,5 +65,8 @@ educe = { workspace = true }
 [build-dependencies]
 sail-build-scripts = { path = "../sail-build-scripts" }
 
+[dev-dependencies]
+sail-catalog-memory = { path = "../sail-catalog-memory" }
+
 [lints]
 workspace = true

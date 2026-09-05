@@ -438,9 +438,11 @@ impl PrimitiveType {
             }
             PrimitiveType::Fixed(_)
             | PrimitiveType::Binary
-            | PrimitiveType::Variant
             | PrimitiveType::Geometry { .. }
             | PrimitiveType::Geography { .. } => PL::Binary(bytes.to_vec()),
+            PrimitiveType::Variant => {
+                return Err("variant bound decoding not supported".to_string());
+            }
             PrimitiveType::Decimal { .. } => {
                 if bytes.is_empty() || bytes.len() > 16 {
                     return Err("Invalid decimal bound bytes".to_string());

@@ -70,18 +70,22 @@ fn primitive_literal_to_scalar(prim: &PrimitiveLiteral, prim_type: &PrimitiveTyp
         (PrimitiveType::Decimal { precision, scale }, PL::Int128(v)) => {
             SV::Decimal128(Some(*v), *precision as u8, *scale as i8)
         }
+        // UUID: UInt128 -> Arrow fixed-size binary
         (PrimitiveType::Uuid, PL::UInt128(value)) => {
             SV::FixedSizeBinary(16, Some(value.to_be_bytes().to_vec()))
         }
-        (PrimitiveType::Fixed(size), PL::Binary(value)) => match i32::try_from(*size) {
-            Ok(size) => SV::FixedSizeBinary(size, Some(value.clone())),
+        // Fixed: use Arrow fixed-size binary when the Iceberg length fits Arrow's i32 size.
+        (PrimitiveType::Fixed(length), PL::Binary(value)) => match i32::try_from(*length) {
+            Ok(length) => SV::FixedSizeBinary(length, Some(value.clone())),
             Err(_) => SV::LargeBinary(Some(value.clone())),
         },
-        (PrimitiveType::Binary, PL::Binary(value))
-        | (PrimitiveType::Geometry { .. }, PL::Binary(value))
-        | (PrimitiveType::Geography { .. }, PL::Binary(value)) => {
-            SV::LargeBinary(Some(value.clone()))
-        }
+        // Variable-width binary primitives map to Arrow large binary.
+        (
+            PrimitiveType::Binary
+            | PrimitiveType::Geometry { .. }
+            | PrimitiveType::Geography { .. },
+            PL::Binary(value),
+        ) => SV::LargeBinary(Some(value.clone())),
         // Iceberg encodes String lower/upper bounds as raw bytes (UTF-8) in file metrics.
         // Decode them so pruning predicates comparing against Utf8 literals work.
         (PrimitiveType::String, PL::Binary(b)) => {
@@ -644,6 +648,36 @@ mod tests {
     }
 
     #[test]
+    fn test_binary_literal_to_scalar_with_type() {
+        let uuid = 0x0011_2233_4455_6677_8899_aabb_ccdd_eeff_u128;
+        assert_eq!(
+            primitive_literal_to_scalar(&PrimitiveLiteral::UInt128(uuid), &PrimitiveType::Uuid),
+            ScalarValue::FixedSizeBinary(16, Some(uuid.to_be_bytes().to_vec()))
+        );
+        assert_eq!(
+            primitive_literal_to_scalar(
+                &PrimitiveLiteral::Binary(vec![1, 2, 3]),
+                &PrimitiveType::Fixed(3),
+            ),
+            ScalarValue::FixedSizeBinary(3, Some(vec![1, 2, 3]))
+        );
+        assert_eq!(
+            primitive_literal_to_scalar(
+                &PrimitiveLiteral::Binary(vec![1, 2, 3]),
+                &PrimitiveType::Binary,
+            ),
+            ScalarValue::LargeBinary(Some(vec![1, 2, 3]))
+        );
+        assert_eq!(
+            primitive_literal_to_scalar(
+                &PrimitiveLiteral::Binary(vec![1, 2, 3]),
+                &PrimitiveType::Geometry { crs: None },
+            ),
+            ScalarValue::LargeBinary(Some(vec![1, 2, 3]))
+        );
+    }
+
+    #[test]
     fn test_list_scalar_preserves_element_field_metadata() -> Result<()> {
         let list_type = Type::List(ListType::new(Arc::new(NestedField::list_element(
             17,
@@ -658,6 +692,7 @@ mod tests {
         assert_eq!(scalar.data_type(), iceberg_type_to_arrow(&list_type)?);
         Ok(())
     }
+
 
     #[test]
     fn scalar_to_primitive_literal_uses_logical_type() -> Result<(), String> {
