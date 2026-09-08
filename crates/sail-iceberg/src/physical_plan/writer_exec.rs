@@ -37,7 +37,7 @@ use sail_common_datafusion::datasource::{
 use url::Url;
 
 use crate::io::StoreContext;
-use crate::operations::write::config::WriterConfig;
+use crate::operations::write::config::{DEFAULT_MAX_OPEN_WRITERS, WriterConfig};
 use crate::operations::write::table_writer::IcebergTableWriter;
 use crate::physical_plan::action_schema::{
     CommitMeta, encode_add_data_files, encode_commit_meta, encode_delete_data_files,
@@ -380,6 +380,7 @@ impl ExecutionPlan for IcebergWriterExec {
                 iceberg_schema: Arc::new(iceberg_schema.clone()),
                 partition_spec: write_context.unbound_writer_partition_spec(),
                 variant_shredding,
+                max_open_writers: DEFAULT_MAX_OPEN_WRITERS,
             };
 
             let data_object_store = get_object_store_from_context(&context, &data_location)?;
