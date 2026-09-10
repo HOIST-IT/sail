@@ -556,7 +556,11 @@ mod tests {
             assert_eq!(writer.writers.len(), 1);
 
             let files = writer.close().await?;
-            assert_eq!(files.len(), 1, "three batches of one partition must not split");
+            assert_eq!(
+                files.len(),
+                1,
+                "three batches of one partition must not split"
+            );
             Ok(())
         })
     }
