@@ -12,6 +12,7 @@
 
 use std::sync::Arc;
 
+use datafusion::arrow::compute::SortOptions;
 use datafusion::catalog::Session;
 use datafusion::common::Result;
 use datafusion::physical_expr::expressions::Column;
@@ -45,7 +46,6 @@ pub struct IcebergPlanBuilder<'a> {
     expected_snapshot_id: Option<Option<i64>>,
     removed_data_file_paths: Vec<String>,
     dynamic_partition_overwrite: bool,
-    #[expect(unused)]
     session: &'a dyn Session,
 }
 
@@ -112,51 +112,60 @@ impl<'a> IcebergPlanBuilder<'a> {
         &self,
         input: Arc<dyn ExecutionPlan>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let repartitioning = if self.table_config.partition_columns.is_empty() {
-            Partitioning::RoundRobinBatch(4)
-        } else {
-            let schema = input.schema();
-            let mut seen = std::collections::HashSet::new();
-            let partition_source_columns = self
-                .table_config
-                .partition_columns
-                .iter()
-                .filter_map(|field| {
-                    if seen.insert(field.column.clone()) {
-                        Some(field.column.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>();
-            let exprs: Vec<Arc<dyn PhysicalExpr>> = partition_source_columns
-                .iter()
-                .map(|name| {
-                    let idx = schema.index_of(name).map_err(|_| {
-                        datafusion::common::DataFusionError::Plan(format!(
-                            "Partition column '{}' not found in schema",
-                            name
-                        ))
-                    })?;
-                    Ok(Arc::new(Column::new(name, idx)) as Arc<dyn PhysicalExpr>)
-                })
-                .collect::<Result<Vec<_>>>()?;
-            Partitioning::Hash(exprs, 4)
-        };
-
-        Ok(Arc::new(RepartitionExec::try_new(input, repartitioning)?))
+        // Writer parallelism follows the session target rather than a literal, and no
+        // key-based distribution is requested. `IcebergWriterExec` reports
+        // `UnspecifiedDistribution`, so a hash requirement here was not honored end to end:
+        // every writer task still received rows for every table partition. Grouping is
+        // established inside each task by `add_sort_node` instead, which is what bounds how
+        // many partition writers a task holds open, without capping how many tasks may write
+        // into one table partition.
+        let target_partitions = self.session.config().target_partitions().max(1);
+        if input.properties().output_partitioning().partition_count() >= target_partitions {
+            return Ok(input);
+        }
+        Ok(Arc::new(RepartitionExec::try_new(
+            input,
+            Partitioning::RoundRobinBatch(target_partitions),
+        )?))
     }
 
+    /// Sort task-locally by the partition source columns, then by any user sort order.
+    ///
+    /// This keeps rows for one partition contiguous within a task so `IcebergTableWriter`
+    /// can finish a partition writer when the key changes. It is a grouping aid and not a
+    /// guarantee: an order-preserving transform (identity, `truncate`, the date parts)
+    /// groups by the computed partition value, while `bucket` does not, so the writer keeps
+    /// its own bound on concurrently open writers.
     fn add_sort_node(&self, input: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
-        match self.sort_order.clone() {
-            Some(sort_exprs) => {
-                let lex = LexOrdering::new(sort_exprs).ok_or_else(|| {
-                    datafusion::common::DataFusionError::Internal("Invalid sort order".to_string())
-                })?;
-                Ok(Arc::new(SortExec::new(lex, input)))
+        let schema = input.schema();
+        let mut seen = std::collections::HashSet::new();
+        let mut sort_exprs: Vec<PhysicalSortExpr> = Vec::new();
+        for field in &self.table_config.partition_columns {
+            if !seen.insert(field.column.clone()) {
+                continue;
             }
-            _ => Ok(input),
+            let idx = schema.index_of(&field.column).map_err(|_| {
+                datafusion::common::DataFusionError::Plan(format!(
+                    "Partition column '{}' not found in schema",
+                    field.column
+                ))
+            })?;
+            sort_exprs.push(PhysicalSortExpr {
+                expr: Arc::new(Column::new(&field.column, idx)) as Arc<dyn PhysicalExpr>,
+                options: SortOptions {
+                    descending: false,
+                    nulls_first: false,
+                },
+            });
         }
+        sort_exprs.extend(self.sort_order.clone().unwrap_or_default());
+
+        let Some(lex) = LexOrdering::new(sort_exprs) else {
+            return Ok(input);
+        };
+        Ok(Arc::new(
+            SortExec::new(lex, input).with_preserve_partitioning(true),
+        ))
     }
 
     fn add_writer_node(&self, input: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {

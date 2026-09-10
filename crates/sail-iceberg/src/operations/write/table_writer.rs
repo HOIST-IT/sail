@@ -63,6 +63,10 @@ pub struct IcebergTableWriter {
     // TODO: Roll each partition writer using the `target-file-size-bytes` write option or
     // `write.target-file-size-bytes` table property.
     writers: HashMap<Vec<Option<Literal>>, PartitionWriter>,
+    // Keys of `writers`, least recently written first. Bounds how many partition writers
+    // are open at once so memory does not scale with the partition cardinality one task
+    // happens to see.
+    open_order: Vec<Vec<Option<Literal>>>,
     written: Vec<DataFile>,
     pub partition_spec_id: i32,
 }
@@ -81,6 +85,7 @@ impl IcebergTableWriter {
             config,
             data_url,
             writers: HashMap::new(),
+            open_order: Vec::new(),
             written: Vec::new(),
             partition_spec_id,
         }
@@ -122,12 +127,47 @@ impl IcebergTableWriter {
         };
         let state = self.write_partition_state(state, batch).await?;
         self.writers.insert(
-            partition_values,
+            partition_values.clone(),
             PartitionWriter {
                 partition_dir,
                 state,
             },
         );
+        self.touch_open(&partition_values);
+        self.enforce_open_writer_bound().await?;
+        Ok(())
+    }
+
+    /// Move `key` to the most recently written end of `open_order`.
+    fn touch_open(&mut self, key: &[Option<Literal>]) {
+        match self.open_order.iter().position(|k| k.as_slice() == key) {
+            Some(pos) => {
+                let existing = self.open_order.remove(pos);
+                self.open_order.push(existing);
+            }
+            None => self.open_order.push(key.to_vec()),
+        }
+    }
+
+    /// Finish least recently written partitions until the open-writer bound holds.
+    ///
+    /// Eviction emits an additional data file for that partition, which Iceberg allows, so
+    /// this trades file count for a memory ceiling rather than failing the write. When the
+    /// plan sorts by partition key the bound is never reached, because one partition is
+    /// live at a time.
+    async fn enforce_open_writer_bound(&mut self) -> Result<(), String> {
+        let max_open = self.config.max_open_writers.max(1);
+        while self.writers.len() > max_open {
+            let Some(evicted) = self.open_order.first().cloned() else {
+                break;
+            };
+            self.open_order.remove(0);
+            let Some(writer) = self.writers.remove(&evicted) else {
+                continue;
+            };
+            self.flush_partition(writer.state, &writer.partition_dir, evicted)
+                .await?;
+        }
         Ok(())
     }
 
@@ -357,5 +397,171 @@ impl IcebergTableWriter {
             return Ok(Some(array));
         }
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use datafusion::arrow::array::{Int32Array, StringArray};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use object_store::memory::InMemory;
+
+    use super::*;
+    use crate::operations::write::config::WriterConfig;
+    use crate::spec::partition::{UnboundPartitionField, UnboundPartitionSpec};
+    use crate::spec::types::{PrimitiveType, Type};
+    use crate::spec::{Schema as SpecSchema, Transform};
+
+    fn field_with_id(name: &str, data_type: DataType, id: &str) -> Field {
+        Field::new(name, data_type, true).with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            id.to_string(),
+        )]))
+    }
+
+    /// One writer per partition tuple used to be held open until `close`, so memory grew
+    /// with the partition cardinality a single task happened to see. Writing more
+    /// partitions than the bound must finish the oldest rather than accumulate.
+    #[test]
+    fn open_partition_writers_stay_within_the_configured_bound() -> Result<(), String> {
+        const MAX_OPEN: usize = 2;
+        const PARTITIONS: i32 = 6;
+
+        futures::executor::block_on(async {
+            let arrow_schema = Arc::new(ArrowSchema::new(vec![
+                field_with_id("id", DataType::Int32, "1"),
+                field_with_id("part", DataType::Utf8, "2"),
+            ]));
+            let iceberg_schema = SpecSchema::builder()
+                .with_schema_id(0)
+                .with_fields(vec![
+                    Arc::new(NestedField::optional(
+                        1,
+                        "id",
+                        Type::Primitive(PrimitiveType::Int),
+                    )),
+                    Arc::new(NestedField::optional(
+                        2,
+                        "part",
+                        Type::Primitive(PrimitiveType::String),
+                    )),
+                ])
+                .build()
+                .map_err(|error| error.to_string())?;
+            let config = WriterConfig {
+                table_schema: arrow_schema.clone(),
+                writer_properties: parquet::file::properties::WriterProperties::builder().build(),
+                iceberg_schema: Arc::new(iceberg_schema),
+                partition_spec: UnboundPartitionSpec {
+                    fields: vec![UnboundPartitionField {
+                        source_id: 2,
+                        name: "part".to_string(),
+                        transform: Transform::Identity,
+                    }],
+                },
+                variant_shredding: Default::default(),
+                max_open_writers: MAX_OPEN,
+            };
+            let mut writer = IcebergTableWriter::new(
+                Arc::new(InMemory::new()),
+                ObjectPath::from("t"),
+                config,
+                0,
+                Url::parse("memory:///t/data/").map_err(|error| error.to_string())?,
+            );
+
+            // Each batch carries one distinct partition, so an unbounded map would hold six.
+            for partition in 0..PARTITIONS {
+                let batch = RecordBatch::try_new(
+                    arrow_schema.clone(),
+                    vec![
+                        Arc::new(Int32Array::from(vec![partition])),
+                        Arc::new(StringArray::from(vec![format!("p{partition}")])),
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+                writer.write(&batch).await?;
+                assert!(
+                    writer.writers.len() <= MAX_OPEN,
+                    "held {} open writers, bound is {MAX_OPEN}",
+                    writer.writers.len()
+                );
+            }
+
+            // Eviction must flush rather than drop: every partition still produces a file.
+            let files = writer.close().await?;
+            assert_eq!(files.len(), PARTITIONS as usize);
+            Ok(())
+        })
+    }
+
+    /// The allow pin for the bound: a write that stays under it keeps its writer open, so
+    /// the common sorted case is not split into one file per batch.
+    #[test]
+    fn a_partition_under_the_bound_is_not_evicted_between_batches() -> Result<(), String> {
+        futures::executor::block_on(async {
+            let arrow_schema = Arc::new(ArrowSchema::new(vec![
+                field_with_id("id", DataType::Int32, "1"),
+                field_with_id("part", DataType::Utf8, "2"),
+            ]));
+            let iceberg_schema = SpecSchema::builder()
+                .with_schema_id(0)
+                .with_fields(vec![
+                    Arc::new(NestedField::optional(
+                        1,
+                        "id",
+                        Type::Primitive(PrimitiveType::Int),
+                    )),
+                    Arc::new(NestedField::optional(
+                        2,
+                        "part",
+                        Type::Primitive(PrimitiveType::String),
+                    )),
+                ])
+                .build()
+                .map_err(|error| error.to_string())?;
+            let config = WriterConfig {
+                table_schema: arrow_schema.clone(),
+                writer_properties: parquet::file::properties::WriterProperties::builder().build(),
+                iceberg_schema: Arc::new(iceberg_schema),
+                partition_spec: UnboundPartitionSpec {
+                    fields: vec![UnboundPartitionField {
+                        source_id: 2,
+                        name: "part".to_string(),
+                        transform: Transform::Identity,
+                    }],
+                },
+                variant_shredding: Default::default(),
+                max_open_writers: 4,
+            };
+            let mut writer = IcebergTableWriter::new(
+                Arc::new(InMemory::new()),
+                ObjectPath::from("t"),
+                config,
+                0,
+                Url::parse("memory:///t/data/").map_err(|error| error.to_string())?,
+            );
+
+            for id in 0..3 {
+                let batch = RecordBatch::try_new(
+                    arrow_schema.clone(),
+                    vec![
+                        Arc::new(Int32Array::from(vec![id])),
+                        Arc::new(StringArray::from(vec!["p0"])),
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+                writer.write(&batch).await?;
+            }
+            assert_eq!(writer.writers.len(), 1);
+
+            let files = writer.close().await?;
+            assert_eq!(
+                files.len(),
+                1,
+                "three batches of one partition must not split"
+            );
+            Ok(())
+        })
     }
 }

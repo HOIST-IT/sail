@@ -659,3 +659,39 @@ def test_iceberg_write_rejects_incompatible_type_without_merge_schema(spark, sql
             df.write.format("iceberg").mode("overwrite").save(table.location())
     finally:
         sql_catalog.drop_table(identifier)
+
+
+def test_iceberg_partitioned_write_uses_every_task_without_losing_rows(spark, sql_catalog):
+    """Writer tasks are not serialized per table partition, and the task-local sort that
+    groups rows by partition key must neither drop nor duplicate any of them.
+
+    The write path sorts by the partition source columns so one partition writer is live at
+    a time. That sort is the regression risk here: it reorders every row before the write,
+    so the pin is on row fidelity and on each partition still receiving its own files.
+    """
+    identifier = "default.partitioned_write_parallelism"
+    table = sql_catalog.create_table(
+        identifier=identifier,
+        schema=Schema(
+            NestedField(field_id=1, name="id", field_type=LongType(), required=False),
+            NestedField(field_id=2, name="part", field_type=StringType(), required=False),
+        ),
+        partition_spec=PartitionSpec(
+            PartitionField(source_id=2, field_id=1000, transform=IdentityTransform(), name="part")
+        ),
+    )
+    try:
+        rows = [(index, f"p{index % 4}") for index in range(400)]
+        df = spark.createDataFrame(rows, schema="id LONG, part STRING").repartition(8)
+        df.write.format("iceberg").mode("append").save(table.location())
+
+        read_back = sorted(tuple(row) for row in spark.read.format("iceberg").load(table.location()).collect())
+        assert read_back == sorted(rows)
+
+        static_table = StaticTable.from_metadata(table.location(), properties=pyiceberg_file_io_properties())
+        file_paths = [task.file.file_path for task in static_table.scan().plan_files()]
+        assert file_paths
+        for value in ("part=p0", "part=p1", "part=p2", "part=p3"):
+            assert any(value in path for path in file_paths), f"no data file for {value}"
+    finally:
+        sql_catalog.drop_table(identifier)
