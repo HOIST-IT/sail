@@ -424,3 +424,139 @@ impl IcebergTableWriter {
         crate::schema_defaults::missing_write_value(iceberg_field.as_ref(), num_rows)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use datafusion::arrow::array::{Int32Array, StringArray};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use object_store::memory::InMemory;
+
+    use super::*;
+    use crate::spec::Transform;
+    use crate::spec::partition::{UnboundPartitionField, UnboundPartitionSpec};
+    use crate::spec::types::{NestedField, PrimitiveType, Type};
+
+    /// Large enough that nothing rolls on size, so the tests only observe the open-writer bound.
+    const NO_FILE_ROLLING: u64 = u64::MAX;
+
+    fn arrow_schema() -> SchemaRef {
+        let field = |name: &str, data_type: DataType, id: &str| {
+            Field::new(name, data_type, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                id.to_string(),
+            )]))
+        };
+        Arc::new(ArrowSchema::new(vec![
+            field("id", DataType::Int32, "1"),
+            field("part", DataType::Utf8, "2"),
+        ]))
+    }
+
+    fn partitioned_writer(max_open_writers: usize) -> Result<IcebergTableWriter, String> {
+        let table_schema = arrow_schema();
+        let iceberg_schema = IcebergSchema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                Arc::new(NestedField::optional(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+                Arc::new(NestedField::optional(
+                    2,
+                    "part",
+                    Type::Primitive(PrimitiveType::String),
+                )),
+            ])
+            .build()
+            .map_err(|error| error.to_string())?;
+        let config = WriterConfig {
+            table_schema,
+            writer_properties: parquet::file::properties::WriterProperties::builder().build(),
+            target_file_size_bytes: NO_FILE_ROLLING,
+            sort_order_id: None,
+            iceberg_schema: Arc::new(iceberg_schema),
+            partition_spec: UnboundPartitionSpec {
+                fields: vec![UnboundPartitionField {
+                    source_id: 2,
+                    name: "part".to_string(),
+                    transform: Transform::Identity,
+                }],
+            },
+            variant_shredding: Default::default(),
+            max_open_writers,
+        };
+        Ok(IcebergTableWriter::new(
+            Arc::new(InMemory::new()),
+            ObjectPath::from("t"),
+            config,
+            0,
+            Url::parse("memory:///t/data/").map_err(|error| error.to_string())?,
+        ))
+    }
+
+    fn row(schema: &SchemaRef, id: i32, part: &str) -> Result<RecordBatch, String> {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![id])),
+                Arc::new(StringArray::from(vec![part.to_string()])),
+            ],
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    /// One writer per partition tuple used to be held open until `close`, so memory grew
+    /// with the partition cardinality a single task happened to see. Writing more
+    /// partitions than the bound must finish the oldest rather than accumulate.
+    #[test]
+    fn open_partition_writers_stay_within_the_configured_bound() -> Result<(), String> {
+        const MAX_OPEN: usize = 2;
+        const PARTITIONS: i32 = 6;
+
+        futures::executor::block_on(async {
+            let mut writer = partitioned_writer(MAX_OPEN)?;
+            let schema = writer.config.table_schema.clone();
+
+            // Each batch carries one distinct partition, so an unbounded map would hold six.
+            for partition in 0..PARTITIONS {
+                writer
+                    .write(&row(&schema, partition, &format!("p{partition}"))?)
+                    .await?;
+                assert!(
+                    writer.writers.len() <= MAX_OPEN,
+                    "held {} open writers, bound is {MAX_OPEN}",
+                    writer.writers.len()
+                );
+            }
+
+            // Eviction must flush rather than drop: every partition still produces a file.
+            let files = writer.close().await?;
+            assert_eq!(files.len(), PARTITIONS as usize);
+            Ok(())
+        })
+    }
+
+    /// The allow pin for the bound: a write that stays under it keeps its writer open, so
+    /// the common grouped case is not split into one file per batch.
+    #[test]
+    fn a_partition_under_the_bound_is_not_evicted_between_batches() -> Result<(), String> {
+        futures::executor::block_on(async {
+            let mut writer = partitioned_writer(4)?;
+            let schema = writer.config.table_schema.clone();
+
+            for id in 0..3 {
+                writer.write(&row(&schema, id, "p0")?).await?;
+            }
+            assert_eq!(writer.writers.len(), 1);
+
+            let files = writer.close().await?;
+            assert_eq!(
+                files.len(),
+                1,
+                "three batches of one partition must not split"
+            );
+            Ok(())
+        })
+    }
+}
