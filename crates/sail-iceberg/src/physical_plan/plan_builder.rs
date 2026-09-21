@@ -16,9 +16,8 @@ use datafusion::catalog::Session;
 use datafusion::common::Result;
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{LexOrdering, PhysicalExpr, PhysicalSortExpr};
-use datafusion::physical_plan::repartition::RepartitionExec;
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::sorts::sort::SortExec;
-use datafusion::physical_plan::{ExecutionPlan, Partitioning};
 use sail_common_datafusion::catalog::CatalogPartitionField;
 use sail_common_datafusion::datasource::PhysicalSinkMode;
 use url::Url;
@@ -83,9 +82,16 @@ impl<'a> IcebergPlanBuilder<'a> {
         self
     }
 
+    /// Build the write plan.
+    ///
+    /// There is no repartition layer. Writer parallelism follows the input plan, the same
+    /// choice Delta made when `create_repartition` was dropped, because a literal partition
+    /// count both caps the write and makes the file layout depend on batch arrival order.
+    /// `IcebergWriterExec` reports that it does not benefit from input partitioning, so
+    /// nothing is manufactured for it either, and partition grouping inside a task comes from
+    /// the writer's required input ordering.
     pub async fn build(self) -> Result<Arc<dyn ExecutionPlan>> {
         self.add_projection_node(self.input.clone())
-            .and_then(|plan| self.add_repartition_node(plan))
             .and_then(|plan| self.add_sort_node(plan))
             .and_then(|plan| self.add_writer_node(plan))
             .and_then(|plan| self.add_commit_node(plan))
@@ -137,33 +143,6 @@ impl<'a> IcebergPlanBuilder<'a> {
         Ok(Arc::new(
             datafusion::physical_plan::projection::ProjectionExec::try_new(expressions, input)?,
         ))
-    }
-
-    fn add_repartition_node(
-        &self,
-        input: Arc<dyn ExecutionPlan>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        let repartitioning = if self.table_config.partition_columns.is_empty() {
-            Partitioning::RoundRobinBatch(4)
-        } else {
-            let schema = input.schema();
-            let partition_source_columns = self.partition_source_columns()?;
-            let exprs: Vec<Arc<dyn PhysicalExpr>> = partition_source_columns
-                .iter()
-                .map(|name| {
-                    let idx = schema.index_of(name).map_err(|_| {
-                        datafusion::common::DataFusionError::Plan(format!(
-                            "Partition column '{}' not found in schema",
-                            name
-                        ))
-                    })?;
-                    Ok(Arc::new(Column::new(name, idx)) as Arc<dyn PhysicalExpr>)
-                })
-                .collect::<Result<Vec<_>>>()?;
-            Partitioning::Hash(exprs, 4)
-        };
-
-        Ok(Arc::new(RepartitionExec::try_new(input, repartitioning)?))
     }
 
     fn partition_source_columns(&self) -> Result<Vec<String>> {

@@ -62,6 +62,10 @@ pub struct IcebergTableWriter {
     pub data_url: Url,
     // Typed partition tuple -> writer.
     writers: HashMap<Vec<Option<Literal>>, PartitionWriter>,
+    // Keys of `writers`, least recently written first. Bounds how many partition writers
+    // are open at once so memory does not scale with the partition cardinality one task
+    // happens to see.
+    open_order: Vec<Vec<Option<Literal>>>,
     written: Vec<DataFile>,
     pub partition_spec_id: i32,
 }
@@ -80,6 +84,7 @@ impl IcebergTableWriter {
             config,
             data_url,
             writers: HashMap::new(),
+            open_order: Vec::new(),
             written: Vec::new(),
             partition_spec_id,
         }
@@ -136,6 +141,7 @@ impl IcebergTableWriter {
             if matches!(&state, PartitionWriterState::Open { writer, .. }
                 if writer.estimated_size() >= self.config.target_file_size_bytes)
             {
+                self.close_open(&partition_values);
                 self.flush_partition(state, &partition_dir, partition_values.clone())
                     .await?;
             } else {
@@ -146,7 +152,51 @@ impl IcebergTableWriter {
                         state,
                     },
                 );
+                self.touch_open(&partition_values);
+                self.enforce_open_writer_bound().await?;
             }
+        }
+        Ok(())
+    }
+
+    /// Move `key` to the most recently written end of `open_order`.
+    fn touch_open(&mut self, key: &[Option<Literal>]) {
+        match self.open_order.iter().position(|k| k.as_slice() == key) {
+            Some(pos) => {
+                let existing = self.open_order.remove(pos);
+                self.open_order.push(existing);
+            }
+            None => self.open_order.push(key.to_vec()),
+        }
+    }
+
+    /// Forget `key` once its writer has left `writers`, so the two stay in step.
+    fn close_open(&mut self, key: &[Option<Literal>]) {
+        if let Some(pos) = self.open_order.iter().position(|k| k.as_slice() == key) {
+            self.open_order.remove(pos);
+        }
+    }
+
+    /// Finish least recently written partitions until the open-writer bound holds.
+    ///
+    /// Eviction trades file count for a memory ceiling rather than failing the write, which
+    /// Iceberg allows. The writer's required input ordering leads with the partition keys, so
+    /// a task writes one partition at a time and the one evicted first is the one it finished
+    /// longest ago. Evicting a finished partition costs no extra file. The extra file shows up
+    /// where ordering cannot reach, such as a merge-on-read input distributed by data file
+    /// rather than by partition.
+    async fn enforce_open_writer_bound(&mut self) -> Result<(), String> {
+        let max_open = self.config.max_open_writers.max(1);
+        while self.writers.len() > max_open {
+            let Some(evicted) = self.open_order.first().cloned() else {
+                break;
+            };
+            self.open_order.remove(0);
+            let Some(writer) = self.writers.remove(&evicted) else {
+                continue;
+            };
+            self.flush_partition(writer.state, &writer.partition_dir, evicted)
+                .await?;
         }
         Ok(())
     }
