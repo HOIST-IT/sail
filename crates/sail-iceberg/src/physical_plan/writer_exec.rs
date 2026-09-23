@@ -41,7 +41,7 @@ use sail_common_datafusion::datasource::{
 use url::Url;
 
 use crate::io::StoreContext;
-use crate::operations::write::config::WriterConfig;
+use crate::operations::write::config::{DEFAULT_MAX_OPEN_WRITERS, WriterConfig};
 use crate::operations::write::table_writer::IcebergTableWriter;
 use crate::physical_plan::action_schema::{
     CommitMeta, encode_add_data_files, encode_commit_meta, encode_delete_data_files,
@@ -69,7 +69,7 @@ pub struct IcebergWriterExec {
     write_context: IcebergWriteContext,
     row_level_mode: Option<RowLevelWriteMode>,
     distribution_keys: Option<Vec<Arc<dyn PhysicalExpr>>>,
-    sort_order: Option<LexOrdering>,
+    input_ordering: Option<LexOrdering>,
     parquet_properties: WriterProperties,
     target_file_size_bytes: u64,
     cache: Arc<PlanProperties>,
@@ -102,7 +102,7 @@ impl IcebergWriterExec {
             .unwrap_or_else(|| options.table_properties.iter().cloned().collect());
         let parquet_properties = options.parquet_properties(&properties)?;
         let target_file_size_bytes = options.target_file_size(&properties)?;
-        let sort_order = Self::data_sort_order(input.schema().as_ref(), &write_context)?;
+        let input_ordering = Self::writer_input_ordering(input.schema().as_ref(), &write_context)?;
         Ok(Self {
             input,
             table_url,
@@ -113,7 +113,7 @@ impl IcebergWriterExec {
             write_context,
             row_level_mode: None,
             distribution_keys: None,
-            sort_order,
+            input_ordering,
             parquet_properties,
             target_file_size_bytes,
             cache,
@@ -167,6 +167,38 @@ impl IcebergWriterExec {
             writer.distribution_keys = Some(distribution_keys);
         }
         Ok(writer)
+    }
+
+    /// The ordering the writer needs from its input: partition keys first, table sort order after.
+    ///
+    /// Leading with the partition keys keeps the rows of one table partition contiguous inside a
+    /// task, so the task writes each partition once and never returns to it. A partition writer
+    /// that `IcebergTableWriter` later evicts under its open-writer bound is therefore already
+    /// complete. Without the ordering a writer task receives rows for every table partition
+    /// interleaved and its memory grows with partition cardinality rather than with row count.
+    ///
+    /// The keys are the computed partition values rather than the raw source columns, so `bucket`
+    /// groups as well as `identity` does. That is also what keeps `sort_order_id` honest: every
+    /// row in a data file shares one partition tuple, so the leading keys are constant there and
+    /// the trailing table sort order is what decides the row order inside the file.
+    fn writer_input_ordering(
+        schema: &Schema,
+        context: &IcebergWriteContext,
+    ) -> Result<Option<LexOrdering>> {
+        let mut exprs = Self::data_partition_keys(schema, context)?
+            .into_iter()
+            .map(|expr| PhysicalSortExpr {
+                expr,
+                options: SortOptions {
+                    descending: false,
+                    nulls_first: false,
+                },
+            })
+            .collect::<Vec<_>>();
+        if let Some(sort_order) = Self::data_sort_order(schema, context)? {
+            exprs.extend(sort_order);
+        }
+        Ok(LexOrdering::new(exprs))
     }
 
     fn data_partition_keys(
@@ -390,7 +422,7 @@ impl ExecutionPlan for IcebergWriterExec {
     }
 
     fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {
-        vec![self.sort_order.clone().map(OrderingRequirements::from)]
+        vec![self.input_ordering.clone().map(OrderingRequirements::from)]
     }
 
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
@@ -539,6 +571,7 @@ impl ExecutionPlan for IcebergWriterExec {
                 iceberg_schema: Arc::new(iceberg_schema.clone()),
                 partition_spec: write_context.unbound_writer_partition_spec(),
                 variant_shredding,
+                max_open_writers: DEFAULT_MAX_OPEN_WRITERS,
             };
 
             let data_object_store = get_object_store_from_context(&context, &data_location)?;
@@ -979,7 +1012,10 @@ mod tests {
             let (_, _, commit_meta) =
                 decode_actions_and_meta_from_batch(&batch).expect("commit metadata");
             assert_eq!(
-                commit_meta.expect("commit metadata action").requirements,
+                commit_meta
+                    .first()
+                    .expect("commit metadata action")
+                    .requirements,
                 expected_requirements
             );
 
