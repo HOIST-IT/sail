@@ -107,6 +107,19 @@
         - expected-snapshot-id
       parser: crate::snapshot_properties::parse_expected_snapshot_id
 
+- key: overwrite_mode
+  description: Select overwrite mode.
+  default:
+    value: ""
+    parser: crate::options::parsers::parse_optional_string
+  supported: true
+  rust_type: "Option<String>"
+  scopes: [write]
+  origins:
+    - type: option
+      keys: [overwrite-mode]
+      parser: crate::options::parsers::parse_optional_string
+
 - key: overwrite_schema
   description: |
     If `true`, allows overwriting the schema of the table when using overwrite mode.
@@ -435,12 +448,20 @@
 
 - key: target_file_size_bytes
   description: Override data file target size.
-  supported: false
+  default:
+    value: ""
+    parser: crate::options::parsers::parse_optional_u64
+  supported: true
   rust_type: "Option<u64>"
   scopes: [write]
   origins:
     - type: option
       keys: [target-file-size-bytes]
+      parser: crate::options::parsers::parse_optional_u64
+
+    - type: table_property
+      keys: [write.target-file-size-bytes]
+      case_sensitive: true
       parser: crate::options::parsers::parse_optional_u64
 
 - key: delete_format
@@ -533,16 +554,6 @@
       keys: [output-sort-order-id]
       parser: crate::options::parsers::parse_optional_i64
 
-- key: overwrite_mode
-  description: Select overwrite mode.
-  supported: false
-  rust_type: "Option<String>"
-  scopes: [write]
-  origins:
-    - type: option
-      keys: [overwrite-mode]
-      parser: crate::options::parsers::parse_optional_string
-
 - key: distribution_mode
   description: Override write distribution mode.
   supported: false
@@ -585,7 +596,10 @@
 
 - key: compression_codec
   description: Override compression codec.
-  supported: false
+  default:
+    value: ""
+    parser: crate::options::parsers::parse_optional_string
+  supported: true
   rust_type: "Option<String>"
   scopes: [write]
   origins:
@@ -593,14 +607,27 @@
       keys: [compression-codec]
       parser: crate::options::parsers::parse_optional_string
 
+    - type: table_property
+      keys: [write.parquet.compression-codec]
+      case_sensitive: true
+      parser: crate::options::parsers::parse_optional_string
+
 - key: compression_level
   description: Override compression level.
-  supported: false
+  default:
+    value: ""
+    parser: crate::options::parsers::parse_optional_string
+  supported: true
   rust_type: "Option<String>"
   scopes: [write]
   origins:
     - type: option
       keys: [compression-level]
+      parser: crate::options::parsers::parse_optional_string
+
+    - type: table_property
+      keys: [write.parquet.compression-level]
+      case_sensitive: true
       parser: crate::options::parsers::parse_optional_string
 
 - key: compression_strategy
@@ -904,9 +931,7 @@
         - write.delete.parquet.page-row-limit
         - write.parquet.dict-size-bytes
         - write.delete.parquet.dict-size-bytes
-        - write.parquet.compression-codec
         - write.delete.parquet.compression-codec
-        - write.parquet.compression-level
         - write.delete.parquet.compression-level
         - write.parquet.row-group-check-min-record-count
         - write.delete.parquet.row-group-check-min-record-count
@@ -1103,7 +1128,7 @@
       parser: crate::options::parsers::parse_usize
 
 - key: write_metadata_properties
-  description: Iceberg table properties controlling metadata files and metrics collection.
+  description: Iceberg table properties controlling metadata files.
   supported: false
   rust_type: String
   scopes: [write]
@@ -1113,9 +1138,48 @@
         - write.metadata.compression-codec
         - write.metadata.previous-versions-max
         - write.metadata.delete-after-commit.enabled
-        - write.metadata.metrics.max-inferred-column-defaults
-        - write.metadata.metrics.column.
-        - write.metadata.metrics.default
+      case_sensitive: true
+      parser: crate::options::parsers::parse_string
+
+- key: write_metrics_default
+  description: Default Iceberg file metrics mode (none, counts, full, or truncate(n)).
+  default:
+    value: "truncate(16)"
+    parser: crate::options::parsers::parse_string
+  supported: true
+  rust_type: String
+  scopes: [write]
+  origins:
+    - type: table_property
+      keys: [write.metadata.metrics.default]
+      case_sensitive: true
+      parser: crate::options::parsers::parse_string
+
+- key: write_metrics_column
+  description: Iceberg file metrics mode overrides by column name, resolved from table properties.
+  default:
+    value: ""
+    parser: crate::options::parsers::parse_string
+  supported: true
+  rust_type: String
+  scopes: [write]
+  origins:
+    - type: table_property
+      keys: [write.metadata.metrics.column.]
+      case_sensitive: true
+      parser: crate::options::parsers::parse_string
+
+- key: write_metrics_max_inferred_columns
+  description: Maximum number of fields receiving inferred default metrics when no default mode is set.
+  default:
+    value: "100"
+    parser: crate::options::parsers::parse_string
+  supported: true
+  rust_type: String
+  scopes: [write]
+  origins:
+    - type: table_property
+      keys: [write.metadata.metrics.max-inferred-column-defaults]
       case_sensitive: true
       parser: crate::options::parsers::parse_string
 
@@ -1140,17 +1204,6 @@
       keys: [write.wap.enabled]
       case_sensitive: true
       parser: crate::options::parsers::parse_bool
-
-- key: write_target_file_size_bytes_property
-  description: Iceberg table property controlling data file target size.
-  supported: false
-  rust_type: u64
-  scopes: [write]
-  origins:
-    - type: table_property
-      keys: [write.target-file-size-bytes]
-      case_sensitive: true
-      parser: crate::options::parsers::parse_u64
 
 - key: write_delete_target_file_size_bytes
   description: Iceberg table property controlling delete file target size.

@@ -133,9 +133,12 @@ pub(crate) fn validate_snapshot_properties(properties: &[(String, String)]) -> R
     Ok(())
 }
 
+/// Write options without the snapshot properties, and the properties in canonical key order.
+pub(crate) type ExtractedSnapshotProperties = (Vec<OptionLayer>, Vec<(String, String)>);
+
 pub(crate) fn extract_snapshot_properties(
     options: Vec<OptionLayer>,
-) -> Result<(Vec<OptionLayer>, Vec<(String, String)>)> {
+) -> Result<ExtractedSnapshotProperties> {
     let mut properties = BTreeMap::new();
     let mut clean_options = Vec::with_capacity(options.len());
 
@@ -186,6 +189,7 @@ pub(crate) fn insert_snapshot_properties(
 }
 
 #[cfg(test)]
+#[expect(clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::spec::Operation;

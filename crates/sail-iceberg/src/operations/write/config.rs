@@ -16,14 +16,30 @@ use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use parquet::file::properties::WriterProperties;
 pub use sail_common_datafusion::variant::VariantShreddingConfig;
 
+use super::metrics::MetricsConfig;
 use crate::spec::Schema as IcebergSchema;
 use crate::spec::partition::UnboundPartitionSpec;
+
+/// Upper bound on partition writers one `IcebergTableWriter` keeps open at once.
+///
+/// Each open writer holds a Parquet row-group buffer, so an unbounded map grows with the
+/// partition cardinality a single task happens to see. `IcebergWriterExec` asks its input to
+/// lead with the partition keys, so a task writes one partition at a time and the writers it
+/// still holds are finished ones. This bound caps how many of those it keeps before it
+/// flushes the oldest.
+pub const DEFAULT_MAX_OPEN_WRITERS: usize = 32;
 
 #[derive(Debug, Clone)]
 pub struct WriterConfig {
     pub table_schema: ArrowSchemaRef,
     pub writer_properties: WriterProperties,
+    pub target_file_size_bytes: u64,
+    pub sort_order_id: Option<i32>,
     pub iceberg_schema: Arc<IcebergSchema>,
     pub partition_spec: UnboundPartitionSpec,
     pub variant_shredding: VariantShreddingConfig,
+    pub metrics: MetricsConfig,
+    /// Maximum number of concurrently open partition writers. Exceeding it finishes the
+    /// least recently written partition, which emits an extra data file rather than failing.
+    pub max_open_writers: usize,
 }

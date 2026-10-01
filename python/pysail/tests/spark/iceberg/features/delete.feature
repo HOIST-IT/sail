@@ -1,4 +1,4 @@
-Feature: Iceberg copy-on-write DELETE
+Feature: Iceberg DELETE reports the rows it deletes
 
   Background:
     Given variable location for temporary directory iceberg_delete
@@ -7,7 +7,7 @@ Feature: Iceberg copy-on-write DELETE
       DROP TABLE IF EXISTS iceberg_delete_table
       """
 
-  Scenario: DELETE rewrites only candidate files and records a delete snapshot
+  Scenario: DELETE rewrites only candidate files and reports the deleted rows
     Given statement template
       """
       CREATE TABLE iceberg_delete_table (id INT, value STRING)
@@ -23,11 +23,14 @@ Feature: Iceberg copy-on-write DELETE
       INSERT INTO iceberg_delete_table VALUES (10, 'keep-second-file')
       """
     Given remember current iceberg data manifest paths
-    Given statement
+    When query
       """
       DELETE FROM iceberg_delete_table WHERE id = 1
       """
-    Then iceberg snapshot operation is delete
+    Then query result
+      | count |
+      | 1     |
+    Then iceberg snapshot operation is overwrite
     Then iceberg current data manifests reuse 1 remembered paths
     Then iceberg snapshot count is 3
     When query
@@ -50,10 +53,13 @@ Feature: Iceberg copy-on-write DELETE
       """
       INSERT INTO iceberg_delete_table VALUES (1, NULL), (2, 10), (3, 1)
       """
-    Given statement
+    When query
       """
       DELETE FROM iceberg_delete_table WHERE score > 5
       """
+    Then query result
+      | count |
+      | 1     |
     When query
       """
       SELECT * FROM iceberg_delete_table ORDER BY id
@@ -63,7 +69,7 @@ Feature: Iceberg copy-on-write DELETE
       | 1  | NULL  |
       | 3  | 1     |
 
-  Scenario: DELETE without WHERE removes all rows
+  Scenario: DELETE without WHERE removes all rows from metadata
     Given statement template
       """
       CREATE TABLE iceberg_delete_table (id INT)
@@ -74,10 +80,13 @@ Feature: Iceberg copy-on-write DELETE
       """
       INSERT INTO iceberg_delete_table VALUES (1), (2), (3)
       """
-    Given statement
+    When query
       """
       DELETE FROM iceberg_delete_table
       """
+    Then query result
+      | count |
+      | 3     |
     Then iceberg snapshot operation is delete
     Then iceberg snapshot count is 2
     When query
@@ -98,10 +107,13 @@ Feature: Iceberg copy-on-write DELETE
       """
       INSERT INTO iceberg_delete_table VALUES (1), (2), (3)
       """
-    Given statement
+    When query
       """
       DELETE FROM iceberg_delete_table WHERE id = 999
       """
+    Then query result
+      | count |
+      | 0     |
     Then iceberg snapshot count is 1
     Then iceberg snapshot operation is append
     When query

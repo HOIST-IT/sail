@@ -123,3 +123,66 @@ def test_iceberg_predicate_overwrite_rejects_stale_expected_snapshot_id(spark, t
         assert {str(task.file.file_path) for task in table.scan().plan_files()} == live_files_before
     finally:
         spark.sql(f"DROP TABLE IF EXISTS {table_name}")
+
+
+def test_iceberg_append_commits_with_current_expected_snapshot_id(spark, tmp_path):
+    table_name = "iceberg_append_expected_snapshot"
+    location = tmp_path / table_name
+    _create_partitioned_table(spark, table_name, location)
+    try:
+        schema = "id BIGINT, category STRING, value BIGINT"
+        spark.createDataFrame([(1, "A", 10)], schema=schema).writeTo(table_name).append()
+        table = StaticTable.from_metadata(
+            str(location),
+            properties=pyiceberg_file_io_properties(),
+        )
+        current_snapshot = table.current_snapshot()
+        assert current_snapshot is not None
+
+        (
+            spark.createDataFrame([(2, "B", 20)], schema=schema)
+            .writeTo(table_name)
+            .option("expected-snapshot-id", str(current_snapshot.snapshot_id))
+            .option("snapshot-property.hoist.publication-id", "publication-456")
+            .append()
+        )
+
+        table = StaticTable.from_metadata(
+            str(location),
+            properties=pyiceberg_file_io_properties(),
+        )
+        snapshot = table.current_snapshot()
+        assert snapshot is not None
+        assert snapshot.parent_snapshot_id == current_snapshot.snapshot_id
+        assert snapshot.summary is not None
+        assert snapshot.summary.additional_properties["hoist.publication-id"] == "publication-456"
+        assert [row["id"] for row in spark.table(table_name).orderBy("id").collect()] == [1, 2]
+    finally:
+        spark.sql(f"DROP TABLE IF EXISTS {table_name}")
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "error"),
+    [
+        ("expected-snapshot-id", "0", "expected-snapshot-id"),
+        ("expected-snapshot-id", "not-a-snapshot", "expected-snapshot-id"),
+        ("snapshot-property.total-records", "1", "reserved"),
+        ("snapshot-property.operation", "append", "reserved"),
+    ],
+)
+def test_iceberg_write_rejects_invalid_publication_controls(spark, tmp_path, key, value, error):
+    table_name = "iceberg_invalid_publication_controls"
+    location = tmp_path / table_name
+    _create_partitioned_table(spark, table_name, location)
+    try:
+        schema = "id BIGINT, category STRING, value BIGINT"
+        spark.createDataFrame([(1, "A", 10)], schema=schema).writeTo(table_name).append()
+        metadata_files_before = set((location / "metadata").glob("*.metadata.json"))
+
+        with pytest.raises(Exception, match=error):
+            spark.createDataFrame([(2, "B", 20)], schema=schema).writeTo(table_name).option(key, value).append()
+
+        assert set((location / "metadata").glob("*.metadata.json")) == metadata_files_before
+        assert [row["id"] for row in spark.table(table_name).collect()] == [1]
+    finally:
+        spark.sql(f"DROP TABLE IF EXISTS {table_name}")
