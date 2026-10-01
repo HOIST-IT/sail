@@ -60,6 +60,12 @@ pub struct IcebergWriterExecOptions {
     pub variant_inference_buffer_size: usize,
     pub variant_inference_buffer_size_explicit: bool,
     pub target_file_size: u64,
+    /// Report the target rows a row-level write deletes instead of the data rows it writes.
+    ///
+    /// Row-level DELETE sets this so that the committed `count` is the number of deleted
+    /// rows on every write path, rather than the copy-on-write survivors that were rewritten.
+    #[serde(default)]
+    pub count_deleted_rows: bool,
 }
 
 impl Default for IcebergWriterExecOptions {
@@ -81,6 +87,7 @@ impl Default for IcebergWriterExecOptions {
             variant_inference_buffer_size: 100,
             variant_inference_buffer_size_explicit: false,
             target_file_size: 134_217_728,
+            count_deleted_rows: false,
         }
     }
 }
@@ -104,6 +111,7 @@ impl From<IcebergWriteOptions> for IcebergWriterExecOptions {
             variant_inference_buffer_size: options.variant_inference_buffer_size,
             variant_inference_buffer_size_explicit: false,
             target_file_size: 134_217_728,
+            count_deleted_rows: false,
         }
     }
 }
