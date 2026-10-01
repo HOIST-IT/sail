@@ -436,9 +436,10 @@ mod tests {
     use object_store::memory::InMemory;
 
     use super::*;
-    use crate::spec::Transform;
+    use crate::operations::write::metrics::MetricsConfig;
     use crate::spec::partition::{UnboundPartitionField, UnboundPartitionSpec};
     use crate::spec::types::{NestedField, PrimitiveType, Type};
+    use crate::spec::{SortOrder, Transform};
 
     /// Large enough that nothing rolls on size, so the tests only observe the open-writer bound.
     const NO_FILE_ROLLING: u64 = u64::MAX;
@@ -474,6 +475,11 @@ mod tests {
             ])
             .build()
             .map_err(|error| error.to_string())?;
+        let metrics = MetricsConfig::from_properties(
+            &iceberg_schema,
+            &SortOrder::unsorted_order(),
+            &HashMap::new(),
+        )?;
         let config = WriterConfig {
             table_schema,
             writer_properties: parquet::file::properties::WriterProperties::builder().build(),
@@ -488,6 +494,7 @@ mod tests {
                 }],
             },
             variant_shredding: Default::default(),
+            metrics,
             max_open_writers,
         };
         Ok(IcebergTableWriter::new(
