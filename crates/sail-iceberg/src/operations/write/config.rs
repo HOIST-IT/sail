@@ -16,6 +16,7 @@ use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use parquet::file::properties::WriterProperties;
 pub use sail_common_datafusion::variant::VariantShreddingConfig;
 
+use super::metrics::MetricsConfig;
 use crate::spec::Schema as IcebergSchema;
 use crate::spec::partition::UnboundPartitionSpec;
 
@@ -37,6 +38,7 @@ pub struct WriterConfig {
     pub iceberg_schema: Arc<IcebergSchema>,
     pub partition_spec: UnboundPartitionSpec,
     pub variant_shredding: VariantShreddingConfig,
+    pub metrics: MetricsConfig,
     /// Maximum number of concurrently open partition writers. Exceeding it finishes the
     /// least recently written partition, which emits an extra data file rather than failing.
     pub max_open_writers: usize,
