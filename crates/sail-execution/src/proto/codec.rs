@@ -5914,7 +5914,10 @@ mod tests {
         ]));
         let table_url = Url::parse("file:///tmp/iceberg-cow-codec/")
             .map_err(|error| plan_datafusion_err!("{error}"))?;
-        let options = IcebergWriterExecOptions::default();
+        let options = IcebergWriterExecOptions {
+            count_deleted_rows: true,
+            ..Default::default()
+        };
         let mut write_context = sail_iceberg::physical_plan::prepare_iceberg_write_context(
             &table_url,
             None,
@@ -5950,6 +5953,7 @@ mod tests {
             writer.row_level_mode(),
             Some(RowLevelWriteMode::CopyOnWrite)
         );
+        assert!(writer.options().count_deleted_rows);
         assert_eq!(
             writer
                 .write_context()

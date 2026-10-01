@@ -73,6 +73,32 @@ fn iceberg_schema_evolution_adapter() -> Arc<dyn PhysicalExprAdapterFactory> {
     ))
 }
 
+/// Data files that a DELETE removes from metadata alone, with the live rows they hold.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct IcebergMetadataDelete {
+    pub paths: Vec<String>,
+    pub deleted_rows: u64,
+}
+
+/// The live rows of a data file, when its applicable deletes make them countable from
+/// metadata. A deletion vector records its exact cardinality; other position deletes may
+/// overlap and equality deletes need a scan, so those leave the count unknown.
+fn metadata_live_row_count(
+    data_file: &DataFile,
+    deletes: &crate::spec::delete_index::MatchedDeletes,
+) -> Option<u64> {
+    if !deletes.equality.is_empty() {
+        return None;
+    }
+    match deletes.positional.as_slice() {
+        [] => Some(data_file.record_count()),
+        [deletion_vector] if deletion_vector.is_deletion_vector() => data_file
+            .record_count()
+            .checked_sub(deletion_vector.data_file.record_count),
+        _ => None,
+    }
+}
+
 /// A fixed Iceberg read snapshot and its scan refinements.
 #[derive(Debug, Clone)]
 pub struct IcebergScan {
@@ -393,13 +419,18 @@ impl IcebergScan {
         self
     }
 
+    /// Plan a DELETE that removes whole data files from metadata alone.
+    ///
+    /// Returns `None` when a row-level rewrite is required, either because some candidate
+    /// row may survive the predicate or because the live rows of a candidate file cannot be
+    /// counted from metadata, so that the committed count stays the number of deleted rows.
     pub(crate) async fn metadata_delete_paths(
         &self,
         session: &dyn Session,
         predicate: &Expr,
-    ) -> Result<Option<Vec<String>>> {
+    ) -> Result<Option<IcebergMetadataDelete>> {
         if self.snapshot.is_none() {
-            return Ok(Some(Vec::new()));
+            return Ok(Some(IcebergMetadataDelete::default()));
         }
         let table_url = Url::parse(&self.table_uri)
             .map_err(|error| datafusion::common::DataFusionError::External(Box::new(error)))?;
@@ -415,13 +446,31 @@ impl IcebergScan {
             &self.partition_specs,
             files,
         );
-        Ok(selected.all_rows_match.then(|| {
-            selected
-                .candidates
-                .into_iter()
-                .map(|(file, _)| file.file_path)
-                .collect()
-        }))
+        if !selected.all_rows_match {
+            return Ok(None);
+        }
+        if selected.candidates.is_empty() {
+            return Ok(Some(IcebergMetadataDelete::default()));
+        }
+        let deletes = self.build_delete_file_index(&store_ctx, &manifests).await?;
+        let mut metadata_delete = IcebergMetadataDelete::default();
+        for (file, data_sequence_number) in selected.candidates {
+            let Some(live_rows) =
+                metadata_live_row_count(&file, &deletes.for_data_file(&file, data_sequence_number))
+            else {
+                return Ok(None);
+            };
+            metadata_delete.deleted_rows = metadata_delete
+                .deleted_rows
+                .checked_add(live_rows)
+                .ok_or_else(|| {
+                    datafusion::common::DataFusionError::Execution(
+                        "Iceberg metadata DELETE row count overflow".to_string(),
+                    )
+                })?;
+            metadata_delete.paths.push(file.file_path);
+        }
+        Ok(Some(metadata_delete))
     }
 
     pub(crate) async fn predicate_overwrite_paths(
@@ -1647,6 +1696,63 @@ mod tests {
         file.upper_bounds = file.lower_bounds.clone();
         file.null_value_counts = HashMap::from([(1, 0), (2, 0)]);
         Ok((read_scan, file))
+    }
+
+    #[test]
+    fn metadata_delete_counts_only_rows_known_to_be_live() -> Result<()> {
+        use crate::spec::delete_index::MatchedDeletes;
+        use crate::spec::{DataContentType, DataFileFormat};
+
+        let (_, mut data_file) = statistics_fixture()?;
+        data_file.record_count = 5;
+        let delete_ref = |content, file_format, record_count| {
+            let mut delete_file = data_file.clone();
+            delete_file.file_path = "delete.file".to_string();
+            delete_file.content = content;
+            delete_file.file_format = file_format;
+            delete_file.record_count = record_count;
+            delete_file.referenced_data_file = Some(data_file.file_path.clone());
+            DeleteFileRef {
+                data_file: delete_file,
+                data_sequence_number: 2,
+                partition_spec_id: 0,
+                is_unpartitioned_spec: true,
+            }
+        };
+        let deletion_vector =
+            delete_ref(DataContentType::PositionDeletes, DataFileFormat::Puffin, 2);
+        let position_delete =
+            delete_ref(DataContentType::PositionDeletes, DataFileFormat::Parquet, 2);
+        let equality_delete =
+            delete_ref(DataContentType::EqualityDeletes, DataFileFormat::Parquet, 1);
+
+        assert_eq!(
+            metadata_live_row_count(&data_file, &MatchedDeletes::default()),
+            Some(5)
+        );
+        assert_eq!(
+            metadata_live_row_count(
+                &data_file,
+                &MatchedDeletes {
+                    positional: vec![deletion_vector],
+                    equality: vec![],
+                },
+            ),
+            Some(3)
+        );
+        for deletes in [
+            MatchedDeletes {
+                positional: vec![position_delete],
+                equality: vec![],
+            },
+            MatchedDeletes {
+                positional: vec![],
+                equality: vec![equality_delete],
+            },
+        ] {
+            assert_eq!(metadata_live_row_count(&data_file, &deletes), None);
+        }
+        Ok(())
     }
 
     #[test]

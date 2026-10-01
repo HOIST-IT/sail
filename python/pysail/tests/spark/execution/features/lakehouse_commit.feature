@@ -116,6 +116,33 @@ Feature: Lakehouse commits in distributed execution
         | UPDATE distributed_iceberg_commit SET id = id + 1000 WHERE id < 10                                                                                    | 400   | 10      |
         | MERGE INTO distributed_iceberg_commit t USING (SELECT id FROM range(10)) s ON t.id = s.id AND t.id < 10 WHEN MATCHED THEN UPDATE SET id = t.id + 1000 | 400   | 10      |
 
+    Scenario: Iceberg DELETE reports the deleted rows from distributed execution
+      Given statement
+        """
+        INSERT INTO distributed_iceberg_commit SELECT id FROM range(0, 400, 1, 4)
+        """
+      When query
+        """
+        DELETE FROM distributed_iceberg_commit WHERE id < 10
+        """
+      Then query result collected
+        | count |
+        | 10    |
+      When query
+        """
+        DELETE FROM distributed_iceberg_commit WHERE id = -1
+        """
+      Then query result collected
+        | count |
+        | 0     |
+      When query
+        """
+        DELETE FROM distributed_iceberg_commit WHERE id >= 0
+        """
+      Then query result collected
+        | count |
+        | 390   |
+
     Scenario: Iceberg metadata DELETE commits without scanning data files
       Given statement
         """

@@ -564,6 +564,7 @@ impl ExecutionPlan for IcebergWriterExec {
                 .field_with_name(MERGE_ROW_INDEX_COLUMN)
                 .is_ok();
         let options = self.options.clone();
+        let count_deleted_rows = options.count_deleted_rows && merge_projection.is_some();
         let write_context = self.write_context.clone();
         let parquet_properties = self.parquet_properties.clone();
         let target_file_size_bytes = self.target_file_size_bytes;
@@ -656,6 +657,15 @@ impl ExecutionPlan for IcebergWriterExec {
             while let Some(batch_result) = data.next().await {
                 let input_batch = batch_result?;
                 let batch = if let Some(merge_projection) = &merge_projection {
+                    if count_deleted_rows {
+                        total_rows = total_rows
+                            .checked_add(merge_projection.deleted_row_count(&input_batch)?)
+                            .ok_or_else(|| {
+                                DataFusionError::Execution(
+                                    "Iceberg deleted row count overflow".to_string(),
+                                )
+                            })?;
+                    }
                     if let Some(position_deletes) = &mut position_deletes {
                         let base_table_context = base_table_context.ok_or_else(|| {
                             DataFusionError::Internal(
@@ -688,9 +698,11 @@ impl ExecutionPlan for IcebergWriterExec {
                 if batch_row_count == 0 {
                     continue;
                 }
-                total_rows += u64::try_from(batch_row_count).map_err(|e| {
-                    DataFusionError::Execution(format!("Row count overflow: {}", e))
-                })?;
+                if !count_deleted_rows {
+                    total_rows += u64::try_from(batch_row_count).map_err(|e| {
+                        DataFusionError::Execution(format!("Row count overflow: {}", e))
+                    })?;
+                }
                 writer
                     .write(&batch)
                     .await

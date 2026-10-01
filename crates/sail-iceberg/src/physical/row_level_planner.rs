@@ -256,7 +256,7 @@ async fn plan_metadata_delete(
         .condition()
         .map(|condition| condition.expr.clone())
         .unwrap_or_else(|| datafusion_expr::lit(true));
-    let Some(paths) = crate::logical::row_level::target_scan(node.raw_target())?
+    let Some(metadata_delete) = crate::logical::row_level::target_scan(node.raw_target())?
         .metadata_delete_paths(session, &predicate)
         .await?
     else {
@@ -278,7 +278,8 @@ async fn plan_metadata_delete(
     )?;
     let batch = encode_commit_meta(CommitMeta {
         table_uri: table_url.to_string(),
-        removed_data_file_paths: paths,
+        row_count: metadata_delete.deleted_rows,
+        removed_data_file_paths: metadata_delete.paths,
         skip_empty_commit: true,
         requirements: write_context.requirements,
         table_properties: writer_options.table_properties.clone(),
@@ -321,5 +322,7 @@ fn resolve_row_level_writer_options(
     writer_options.apply_variant_shredding_option_presence(variant_presence);
     writer_options.table_properties = table_properties;
     writer_options.lakehouse_table = node.target_lakehouse_table().cloned();
+    // DELETE reports the rows it removed, whichever write path executes it.
+    writer_options.count_deleted_rows = node.command() == RowLevelCommand::Delete;
     Ok(writer_options)
 }
