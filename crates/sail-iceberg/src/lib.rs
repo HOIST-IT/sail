@@ -26,6 +26,7 @@ pub(crate) mod row_level_metadata;
 mod row_lineage;
 mod schema_defaults;
 pub mod schema_evolution;
+pub(crate) mod snapshot_properties;
 pub mod spec;
 pub mod table;
 pub mod utils;

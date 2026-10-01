@@ -29,6 +29,10 @@ pub struct IcebergCommitInfo {
     pub updates: Vec<TableUpdate>,
     pub requirements: Vec<TableRequirement>,
     pub table_properties: Vec<(String, String)>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub snapshot_properties: Vec<(String, String)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_expected_snapshot_id: Option<i64>,
     pub lakehouse_table: Option<LakehouseExecutionContext>,
     pub snapshot_update_kind: SnapshotUpdateKind,
     #[serde(skip_serializing_if = "Option::is_none")]

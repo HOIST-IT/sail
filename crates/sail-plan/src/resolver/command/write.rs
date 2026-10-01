@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::{Field, Schema};
@@ -200,6 +201,36 @@ impl WritePlanBuilder {
     }
 }
 
+fn has_direct_option(options: &[OptionLayer], expected_key: &str) -> bool {
+    options.iter().any(|layer| match layer {
+        OptionLayer::OptionList { items } => items
+            .iter()
+            .any(|(key, _)| key.eq_ignore_ascii_case(expected_key)),
+        _ => false,
+    })
+}
+
+/// Reject a caller snapshot expectation that an ignored write mode could never check,
+/// before the target table is looked up.
+async fn resolve_table_info_after_control_guard<T, F, Fut>(
+    mode: &WriteMode,
+    options: &[OptionLayer],
+    lookup: F,
+) -> PlanResult<T>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = PlanResult<T>>,
+{
+    if matches!(mode, WriteMode::ErrorIfExists | WriteMode::IgnoreIfExists)
+        && has_direct_option(options, "expected-snapshot-id")
+    {
+        return Err(PlanError::invalid(
+            "Iceberg write option `expected-snapshot-id` cannot be used with ErrorIfExists or IgnoreIfExists",
+        ));
+    }
+    lookup().await
+}
+
 impl PlanResolver<'_> {
     /// Builds a write logical plan and any catalog preconditions needed before executing it.
     pub(super) async fn resolve_write_with_builder(
@@ -285,7 +316,11 @@ impl PlanResolver<'_> {
                 table,
                 column_match,
             } => {
-                let info = self.resolve_table_info(&table).await?;
+                let info =
+                    resolve_table_info_after_control_guard(&mode, &sink_info.options, || {
+                        self.resolve_table_info(&table)
+                    })
+                    .await?;
 
                 // Return early if the target exists and the mode says to skip
                 if matches!(mode, WriteMode::IgnoreIfExists) && info.is_some() {
@@ -450,6 +485,8 @@ impl PlanResolver<'_> {
                                 .filter_map(|(k, v)| {
                                     if !k.eq_ignore_ascii_case("path")
                                         && !k.eq_ignore_ascii_case("location")
+                                        && !(write_format.eq_ignore_ascii_case("iceberg")
+                                            && Self::is_iceberg_commit_only_option(&k))
                                     {
                                         Some((format!("option.{k}"), v))
                                     } else {
@@ -1659,6 +1696,14 @@ impl PlanResolver<'_> {
         }))
     }
 
+    /// Iceberg options that control one commit and must not persist as table properties.
+    fn is_iceberg_commit_only_option(key: &str) -> bool {
+        key.eq_ignore_ascii_case("expected-snapshot-id")
+            || key
+                .get(.."snapshot-property.".len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("snapshot-property."))
+    }
+
     fn has_truthy_option(options: &[OptionLayer], keys: &[&str]) -> bool {
         options.iter().rev().any(|layer| match layer {
             OptionLayer::OptionList { items } | OptionLayer::TablePropertyList { items } => {
@@ -1920,5 +1965,76 @@ impl TableInfo {
             }
         };
         bucket_by_match && sort_by_match
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::expect_used)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn ignored_write_modes_reject_expected_snapshot_before_catalog_lookup() {
+        for mode in [WriteMode::ErrorIfExists, WriteMode::IgnoreIfExists] {
+            let lookup_called = AtomicBool::new(false);
+            let options = vec![OptionLayer::OptionList {
+                items: vec![("EXPECTED-SNAPSHOT-ID".to_string(), "17".to_string())],
+            }];
+
+            let error = resolve_table_info_after_control_guard(&mode, &options, || {
+                lookup_called.store(true, Ordering::SeqCst);
+                async { Ok::<_, PlanError>(()) }
+            })
+            .await
+            .expect_err("ignored controlled write must fail");
+
+            assert!(error.to_string().contains("expected-snapshot-id"));
+            assert!(!lookup_called.load(Ordering::SeqCst));
+        }
+    }
+
+    #[tokio::test]
+    async fn nonignored_write_mode_reaches_catalog_lookup_spy() {
+        let lookup_called = AtomicBool::new(false);
+        let options = vec![OptionLayer::OptionList {
+            items: vec![("expected-snapshot-id".to_string(), "17".to_string())],
+        }];
+
+        let result = resolve_table_info_after_control_guard(
+            &WriteMode::Append {
+                error_if_absent: false,
+            },
+            &options,
+            || {
+                lookup_called.store(true, Ordering::SeqCst);
+                async { Ok::<_, PlanError>("catalog-result") }
+            },
+        )
+        .await
+        .expect("append lookup result");
+
+        assert_eq!(result, "catalog-result");
+        assert!(lookup_called.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn iceberg_commit_only_options_are_recognized() {
+        for key in [
+            "expected-snapshot-id",
+            "EXPECTED-SNAPSHOT-ID",
+            "snapshot-property.hoist.id",
+            "Snapshot-Property.x",
+        ] {
+            assert!(PlanResolver::is_iceberg_commit_only_option(key), "{key}");
+        }
+        for key in [
+            "snapshot-property",
+            "expected-snapshot",
+            "write.format.default",
+        ] {
+            assert!(!PlanResolver::is_iceberg_commit_only_option(key), "{key}");
+        }
     }
 }

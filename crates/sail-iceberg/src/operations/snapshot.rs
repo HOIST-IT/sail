@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{ActionCommit, Transaction};
 use crate::io::StoreContext;
+use crate::snapshot_properties::{insert_snapshot_properties, validate_snapshot_properties};
 use crate::spec::manifest::{ManifestEntry, ManifestWriter, ManifestWriterBuilder};
 use crate::spec::manifest_list::ManifestListWriter;
 use crate::spec::{
@@ -380,6 +381,7 @@ pub struct SnapshotProducer<'a> {
     pub tx: &'a Transaction,
     pub added_data_files: Vec<DataFile>,
     pub added_delete_files: Vec<DataFile>,
+    pub snapshot_properties: Vec<(String, String)>,
     pub removed_data_file_paths: Vec<String>,
     pub store_ctx: Option<StoreContext>,
     pub manifest_metadata: Option<crate::spec::manifest::ManifestMetadata>,
@@ -478,6 +480,14 @@ impl PreparedSnapshotCommit {
     pub(crate) fn commit_succeeded(mut self) {
         self.cleanup.disarm();
     }
+
+    /// Hand the created paths to the caller for deferred cleanup, disarming the drop guard.
+    /// Bootstrap uses this so that a later failed catalog commit can still remove the
+    /// uncommitted snapshot artifacts.
+    pub(crate) fn into_created_paths(mut self) -> Vec<ObjectPath> {
+        self.cleanup.cleanup_on_drop = false;
+        std::mem::take(&mut self.cleanup.created_paths)
+    }
 }
 
 async fn cleanup_created_paths(store_ctx: &StoreContext, paths: &[ObjectPath]) {
@@ -505,6 +515,7 @@ impl<'a> SnapshotProducer<'a> {
             tx,
             added_data_files,
             added_delete_files: Vec::new(),
+            snapshot_properties: Vec::new(),
             removed_data_file_paths: Vec::new(),
             store_ctx,
             manifest_metadata,
@@ -535,6 +546,11 @@ impl<'a> SnapshotProducer<'a> {
 
     pub fn with_added_delete_files(mut self, delete_files: Vec<DataFile>) -> Self {
         self.added_delete_files = delete_files;
+        self
+    }
+
+    pub fn with_snapshot_properties(mut self, properties: Vec<(String, String)>) -> Self {
+        self.snapshot_properties = properties;
         self
     }
 
@@ -911,6 +927,8 @@ impl<'a> SnapshotProducer<'a> {
         update_kind: SnapshotUpdateKind,
         created_paths: &mut Vec<ObjectPath>,
     ) -> Result<ActionCommit, String> {
+        validate_snapshot_properties(&self.snapshot_properties)
+            .map_err(|error| error.to_string())?;
         let removed_data_file_paths = self
             .removed_data_file_paths
             .iter()
@@ -1246,6 +1264,8 @@ impl<'a> SnapshotProducer<'a> {
                 })?;
             summary = summary.with_property("total-position-deletes", remaining.to_string());
         }
+        insert_snapshot_properties(&mut summary, &self.snapshot_properties)
+            .map_err(|error| error.to_string())?;
 
         let mut list_writer = ManifestListWriter::new();
         let mut total_manifest_count = 0;
