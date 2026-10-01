@@ -150,6 +150,13 @@ impl IcebergMergeRowProjection {
             .collect()
     }
 
+    /// Count the target rows that a batch removes without writing a replacement row.
+    pub(crate) fn deleted_row_count(&self, batch: &RecordBatch) -> Result<u64> {
+        let mask = merge_operation_mask(batch, self.operation_index, merge_operation_deletes_row)?;
+        u64::try_from(mask.true_count())
+            .map_err(|error| DataFusionError::Execution(format!("Row count overflow: {error}")))
+    }
+
     pub(crate) fn project_position_delete_rows(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         let mask = merge_operation_mask(
             batch,
@@ -192,6 +199,12 @@ fn merge_operation_writes_data(value: i32) -> bool {
         || value == RowLevelOperationType::Insert.as_i32()
         || value == RowLevelOperationType::MatchedUpdate.as_i32()
         || value == RowLevelOperationType::NotMatchedBySourceUpdate.as_i32()
+}
+
+fn merge_operation_deletes_row(value: i32) -> bool {
+    value == RowLevelOperationType::Delete.as_i32()
+        || value == RowLevelOperationType::MatchedDelete.as_i32()
+        || value == RowLevelOperationType::NotMatchedBySourceDelete.as_i32()
 }
 
 fn merge_operation_writes_position_delete(value: i32) -> bool {
@@ -268,5 +281,55 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .expect("Int64 row indices");
         assert_eq!(positions.values(), &[0, 1]);
+        assert_eq!(
+            projection
+                .deleted_row_count(&batch)
+                .expect("deleted row count"),
+            1
+        );
+    }
+
+    #[test]
+    fn deleted_row_count_ignores_copies_and_rewrites() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new(MERGE_FILE_COLUMN, DataType::Utf8, true),
+            Field::new(OPERATION_COLUMN, DataType::Int32, true),
+        ]));
+        let operations = [
+            Some(RowLevelOperationType::Copy.as_i32()),
+            Some(RowLevelOperationType::Delete.as_i32()),
+            Some(RowLevelOperationType::Copy.as_i32()),
+            Some(RowLevelOperationType::Delete.as_i32()),
+            Some(RowLevelOperationType::Update.as_i32()),
+            Some(RowLevelOperationType::NotMatchedBySourceDelete.as_i32()),
+            None,
+        ];
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from_iter(
+                    (0..operations.len()).map(|id| i32::try_from(id).ok()),
+                )),
+                Arc::new(StringArray::from(vec![
+                    Some("data.parquet");
+                    operations.len()
+                ])),
+                Arc::new(Int32Array::from(operations.to_vec())),
+            ],
+        )
+        .expect("copy-on-write batch");
+        let projection = IcebergMergeRowProjection::try_new(schema).expect("projection");
+
+        assert_eq!(
+            projection
+                .deleted_row_count(&batch)
+                .expect("deleted row count"),
+            3
+        );
+        let survivors = projection
+            .project_data_rows(&batch, Some(RowLevelWriteMode::CopyOnWrite), false)
+            .expect("survivor rows");
+        assert_eq!(survivors.num_rows(), 3);
     }
 }
