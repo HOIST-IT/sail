@@ -1,3 +1,4 @@
+# ruff: noqa: S608
 import pytest
 
 TABLE_MODES = {

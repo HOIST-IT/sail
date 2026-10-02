@@ -27,9 +27,7 @@ def test_iceberg_predicate_overwrite_persists_snapshot_properties(spark, tmp_pat
     _create_partitioned_table(spark, table_name, location)
     try:
         schema = "id BIGINT, category STRING, value BIGINT"
-        spark.createDataFrame([(1, "A", 10), (2, "B", 20)], schema=schema).writeTo(
-            table_name
-        ).append()
+        spark.createDataFrame([(1, "A", 10), (2, "B", 20)], schema=schema).writeTo(table_name).append()
 
         replacement = spark.createDataFrame([(3, "A", 30)], schema=schema)
         (
@@ -64,9 +62,7 @@ def test_iceberg_predicate_overwrite_rejects_stale_expected_snapshot_id(spark, t
     _create_partitioned_table(spark, table_name, location)
     try:
         schema = "id BIGINT, category STRING, value BIGINT"
-        spark.createDataFrame([(1, "A", 10), (2, "B", 20)], schema=schema).writeTo(
-            table_name
-        ).append()
+        spark.createDataFrame([(1, "A", 10), (2, "B", 20)], schema=schema).writeTo(table_name).append()
         table = StaticTable.from_metadata(
             str(location),
             properties=pyiceberg_file_io_properties(),
@@ -84,11 +80,7 @@ def test_iceberg_predicate_overwrite_rejects_stale_expected_snapshot_id(spark, t
         assert current_snapshot.snapshot_id != stale_snapshot.snapshot_id
 
         rows_before = [
-            tuple(row)
-            for row in spark.table(table_name)
-            .select("id", "category", "value")
-            .orderBy("id")
-            .collect()
+            tuple(row) for row in spark.table(table_name).select("id", "category", "value").orderBy("id").collect()
         ]
         metadata_files_before = set((location / "metadata").glob("*.metadata.json"))
         live_files_before = {str(task.file.file_path) for task in table.scan().plan_files()}
@@ -113,11 +105,7 @@ def test_iceberg_predicate_overwrite_rejects_stale_expected_snapshot_id(spark, t
         assert snapshot_after is not None
         assert snapshot_after.snapshot_id == current_snapshot.snapshot_id
         assert [
-            tuple(row)
-            for row in spark.table(table_name)
-            .select("id", "category", "value")
-            .orderBy("id")
-            .collect()
+            tuple(row) for row in spark.table(table_name).select("id", "category", "value").orderBy("id").collect()
         ] == rows_before
         assert set((location / "metadata").glob("*.metadata.json")) == metadata_files_before
         assert {str(task.file.file_path) for task in table.scan().plan_files()} == live_files_before
