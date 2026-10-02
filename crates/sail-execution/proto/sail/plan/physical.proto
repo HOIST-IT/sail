@@ -1018,6 +1018,10 @@ message CatalogPartitionFieldNode {
 enum IcebergRowLevelWriteMode {
   ICEBERG_ROW_LEVEL_WRITE_MODE_COPY_ON_WRITE = 0;
   ICEBERG_ROW_LEVEL_WRITE_MODE_MERGE_ON_READ = 1;
+  // The same modes for a writer that reports the rows it deleted. A decoder that predates
+  // deleted-row counting rejects these values instead of reporting a different count.
+  ICEBERG_ROW_LEVEL_WRITE_MODE_COPY_ON_WRITE_COUNTING_DELETED_ROWS = 2;
+  ICEBERG_ROW_LEVEL_WRITE_MODE_MERGE_ON_READ_COUNTING_DELETED_ROWS = 3;
 }
 
 message IcebergWriterExecNode {

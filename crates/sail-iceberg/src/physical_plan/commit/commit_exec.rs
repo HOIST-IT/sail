@@ -844,11 +844,13 @@ impl ExecutionPlan for IcebergCommitExec {
                     Self::merge_writer_commit_meta(&mut commit_meta, meta)?;
                 }
             }
+            let has_publication_controls =
+                caller_expected_snapshot_id.is_some() || !snapshot_properties.is_empty();
             // No-op path (e.g. IgnoreIfExists on existing table): no rows, no meta.
             if commit_meta.is_none() && added_data_files.is_empty() && added_delete_files.is_empty()
             {
                 // A controlled write must validate its expectations, so it cannot be skipped.
-                if caller_expected_snapshot_id.is_some() || !snapshot_properties.is_empty() {
+                if has_publication_controls {
                     return Err(DataFusionError::Internal(
                         "controlled Iceberg write produced no commit metadata".to_string(),
                     ));
@@ -1109,6 +1111,16 @@ impl ExecutionPlan for IcebergCommitExec {
                     && commit_info.delete_files.is_empty()
                     && removed_data_file_paths.is_empty()
                 {
+                    // Skipping publishes no snapshot, so the snapshot properties would be
+                    // dropped and the caller could not tell this write from one that never ran.
+                    // A controlled write must publish what its controls describe.
+                    if has_publication_controls {
+                        return plan_err!(
+                            "Iceberg write with publication controls changes no data and would \
+                             publish no snapshot, so its snapshot properties and expected \
+                             snapshot ID cannot be honored"
+                        );
+                    }
                     return commit_count_batch(schema, commit_info.row_count);
                 }
                 let original_format_version = table_meta.format_version;
@@ -3319,6 +3331,142 @@ mod tests {
             let (metadata_files, manifest_lists) = fixture.written_artifacts().await;
             assert_eq!(metadata_files.len(), 2, "{metadata_files:?}");
             assert_eq!(manifest_lists.len(), 2, "{manifest_lists:?}");
+        });
+    }
+
+    fn commit_plan(
+        table_url: &Url,
+        actions: RecordBatch,
+        snapshot_update_kind: SnapshotUpdateKind,
+    ) -> IcebergCommitExec {
+        let input = MemorySourceConfig::try_new_exec(
+            &[vec![actions]],
+            iceberg_action_schema().expect("action schema"),
+            None,
+        )
+        .expect("writer output");
+        IcebergCommitExec::new(input, table_url.clone(), None, snapshot_update_kind)
+    }
+
+    #[test]
+    fn controlled_empty_dynamic_partition_overwrite_fails_closed() {
+        futures::executor::block_on(async {
+            let table_url =
+                Url::parse("file:///tmp/controlled-empty-overwrite/").expect("table URL");
+            let memory = Arc::new(object_store::memory::InMemory::new());
+            let store: Arc<dyn ObjectStore> = memory.clone();
+            let store_ctx = StoreContext::new(Arc::clone(&store), &table_url).expect("store");
+            let table_properties = vec![("format-version".to_string(), "2".to_string())];
+            crate::operations::bootstrap::bootstrap_empty_table_metadata(
+                &table_url,
+                &store_ctx,
+                IcebergSchema::builder()
+                    .with_fields([Arc::new(NestedField::required(
+                        1,
+                        "id",
+                        Type::Primitive(PrimitiveType::Int),
+                    ))])
+                    .build()
+                    .expect("schema"),
+                PartitionSpec::unpartitioned_spec(),
+                &table_properties,
+                NewTableMetadataStyle::Hadoop,
+            )
+            .await
+            .expect("bootstrap metadata");
+            let context = SessionContext::new();
+            context
+                .runtime_env()
+                .register_object_store(&Url::parse("file:///").expect("file store URL"), memory);
+            let mut data_file = partitioned_data_file("data/live.parquet", 0, 0);
+            data_file.partition.clear();
+            let append = datafusion::arrow::compute::concat_batches(
+                &iceberg_action_schema().expect("action schema"),
+                &[
+                    encode_add_data_files(vec![data_file]).expect("add action"),
+                    encode_commit_meta(CommitMeta {
+                        table_uri: table_url.to_string(),
+                        row_count: 1,
+                        table_properties: table_properties.clone(),
+                        ..Default::default()
+                    })
+                    .expect("commit metadata"),
+                ],
+            )
+            .expect("append actions");
+            datafusion::physical_plan::collect(
+                Arc::new(commit_plan(
+                    &table_url,
+                    append,
+                    SnapshotUpdateKind::FastAppend,
+                )),
+                context.task_ctx(),
+            )
+            .await
+            .expect("append");
+            let head = crate::table::find_latest_metadata_file(&store, &table_url)
+                .await
+                .expect("metadata location");
+            let metadata = TableMetadata::from_json(
+                &load_metadata_file_bytes(&store, &head)
+                    .await
+                    .expect("metadata bytes"),
+            )
+            .expect("metadata");
+            let snapshot_id = metadata.current_snapshot_id.expect("appended snapshot");
+            let empty_overwrite = encode_commit_meta(CommitMeta {
+                table_uri: table_url.to_string(),
+                table_properties,
+                ..Default::default()
+            })
+            .expect("commit metadata");
+
+            for (snapshot_properties, caller_expected_snapshot_id) in [
+                (
+                    vec![(
+                        "hoist.publication-id".to_string(),
+                        "publication-1".to_string(),
+                    )],
+                    None,
+                ),
+                (vec![], Some(snapshot_id)),
+                (vec![], None),
+            ] {
+                let controlled =
+                    !snapshot_properties.is_empty() || caller_expected_snapshot_id.is_some();
+                let plan: Arc<dyn ExecutionPlan> = Arc::new(
+                    commit_plan(
+                        &table_url,
+                        empty_overwrite.clone(),
+                        SnapshotUpdateKind::CopyOnWrite,
+                    )
+                    .with_expected_snapshot_id(Some(Some(snapshot_id)))
+                    .with_dynamic_partition_overwrite(true)
+                    .with_caller_expected_snapshot_id(caller_expected_snapshot_id)
+                    .with_snapshot_properties(snapshot_properties),
+                );
+                let result = datafusion::physical_plan::collect(plan, context.task_ctx()).await;
+                if controlled {
+                    let error =
+                        result.expect_err("a controlled write that changes nothing must fail");
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("publication controls changes no data"),
+                        "{error}"
+                    );
+                } else {
+                    let batches = result.expect("an uncontrolled empty overwrite is a no-op");
+                    assert_eq!(committed_count(&batches), Some(0));
+                }
+                assert_eq!(
+                    crate::table::find_latest_metadata_file(&store, &table_url)
+                        .await
+                        .expect("metadata location"),
+                    head,
+                    "an empty overwrite must not publish a snapshot"
+                );
+            }
         });
     }
 }
