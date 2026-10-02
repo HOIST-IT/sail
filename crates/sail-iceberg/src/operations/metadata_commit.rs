@@ -11,7 +11,9 @@ use crate::table::metadata_loader::{
     encode_metadata_file, metadata_file_extension_from_properties, table_metadata_location,
     write_version_hint,
 };
-use crate::utils::metadata::metadata_files_for_version;
+use crate::utils::metadata::{
+    ExistingMetadataFile, metadata_files_for_version, reconcile_existing_metadata_file,
+};
 
 #[derive(Clone, Copy)]
 pub(crate) enum MetadataFileStyle {
@@ -88,8 +90,23 @@ impl MetadataFileCommit {
             .await
         {
             Ok(_) => {}
-            Err(object_store::Error::AlreadyExists { .. }) => {
-                return Ok(MetadataWriteOutcome::Conflict);
+            // A retried put whose first attempt landed reports its own file as existing. The
+            // file is read back before the write is treated as a lost race, and an unreadable
+            // file fails as an unknown commit state so that the caller removes nothing.
+            Err(error @ object_store::Error::AlreadyExists { .. }) => {
+                match reconcile_existing_metadata_file(store, &self.path, &self.bytes).await? {
+                    ExistingMetadataFile::Written => {
+                        log::warn!(
+                            "Metadata file {} for version {} was reported as existing but holds \
+                             the bytes this commit sent, so the write landed: {error}",
+                            self.path,
+                            self.version
+                        );
+                    }
+                    ExistingMetadataFile::Concurrent => {
+                        return Ok(MetadataWriteOutcome::Conflict);
+                    }
+                }
             }
             Err(error) => return Err(DataFusionError::External(Box::new(error))),
         }

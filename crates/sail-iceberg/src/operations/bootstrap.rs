@@ -37,6 +37,7 @@ use crate::table::metadata_loader::{
     write_version_hint,
 };
 use crate::utils::WritePathMode;
+use crate::utils::metadata::{ExistingMetadataFile, reconcile_existing_metadata_file};
 
 /// Strategy for persisting metadata during bootstrap
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,18 +172,39 @@ async fn publish_metadata_version(
         metadata_bytes,
     } = prepared;
     // A create-only put keeps a concurrent writer's metadata version from being replaced.
-    store_ctx
+    let metadata_bytes = Bytes::from(metadata_bytes);
+    match store_ctx
         .prefixed
         .put_opts(
             &metadata_path,
-            object_store::PutPayload::from(Bytes::from(metadata_bytes)),
+            object_store::PutPayload::from(metadata_bytes.clone()),
             object_store::PutOptions {
                 mode: object_store::PutMode::Create,
                 ..Default::default()
             },
         )
         .await
-        .map_err(|error| DataFusionError::External(Box::new(error)))?;
+    {
+        Ok(_) => {}
+        // A retried put whose first attempt landed reports its own file as existing, so the
+        // file is read back before the write is treated as a lost race.
+        Err(error @ object_store::Error::AlreadyExists { .. }) => {
+            match reconcile_existing_metadata_file(store_ctx, &metadata_path, &metadata_bytes)
+                .await?
+            {
+                ExistingMetadataFile::Written => {
+                    log::warn!(
+                        "Iceberg metadata file {metadata_file} was reported as existing but holds \
+                         the bytes this write sent, so the write landed: {error}"
+                    );
+                }
+                ExistingMetadataFile::Concurrent => {
+                    return Err(DataFusionError::External(Box::new(error)));
+                }
+            }
+        }
+        Err(error) => return Err(DataFusionError::External(Box::new(error))),
+    }
     write_version_hint(&store_ctx.prefixed, &version_hint).await;
 
     Ok(BootstrapResult {
@@ -206,11 +228,13 @@ async fn publish_bootstrap_snapshot(
             result.created_paths = prepared_snapshot.into_created_paths();
             Ok(result)
         }
+        // Another writer's file holds this version, so nothing references these artifacts.
         Err(error) if is_bootstrap_metadata_conflict(&error) => {
             prepared_snapshot.publication_did_not_happen();
             prepared_snapshot.cleanup().await;
             Err(error)
         }
+        // The metadata file may have landed, so its artifacts are kept.
         Err(error) => Err(error),
     }
 }
