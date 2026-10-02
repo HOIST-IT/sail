@@ -67,7 +67,9 @@ use crate::table::metadata_loader::{
     metadata_file_version_from_path, metadata_location_to_object_path_string, write_version_hint,
 };
 use crate::utils::get_object_store_from_context;
-use crate::utils::metadata::metadata_files_for_version;
+use crate::utils::metadata::{
+    ExistingMetadataFile, metadata_files_for_version, reconcile_existing_metadata_file,
+};
 const MAX_COMMIT_RETRIES: usize = 5;
 
 fn commit_count_batch(schema: SchemaRef, row_count: u64) -> Result<RecordBatch> {
@@ -1598,7 +1600,8 @@ impl ExecutionPlan for IcebergCommitExec {
                     mode: object_store::PutMode::Create,
                     ..Default::default()
                 };
-                let payload = object_store::PutPayload::from(Bytes::from(metadata_bytes));
+                let metadata_bytes = Bytes::from(metadata_bytes);
+                let payload = object_store::PutPayload::from(metadata_bytes.clone());
                 prepared_snapshot.publication_started();
                 match store_ctx
                     .prefixed
@@ -1606,19 +1609,40 @@ impl ExecutionPlan for IcebergCommitExec {
                     .await
                 {
                     Ok(_) => {}
-                    Err(object_store::Error::AlreadyExists { .. }) => {
-                        log::warn!(
-                            "Metadata file {} already exists for version {}. Retrying attempt {}",
-                            metadata_file,
-                            next_version,
-                            attempt
-                        );
-                        prepared_snapshot.publication_did_not_happen();
-                        prepared_snapshot.cleanup().await;
-                        if attempt >= MAX_COMMIT_RETRIES {
-                            return Err(commit_conflict_error());
+                    // A retried put whose first attempt landed reports its own file as
+                    // existing. The file is read back before anything is removed, and an
+                    // unreadable file fails the commit as an unknown state with every
+                    // artifact kept.
+                    Err(error @ object_store::Error::AlreadyExists { .. }) => {
+                        match reconcile_existing_metadata_file(
+                            &store_ctx,
+                            &metadata_path,
+                            &metadata_bytes,
+                        )
+                        .await?
+                        {
+                            ExistingMetadataFile::Written => {
+                                log::warn!(
+                                    "Metadata file {metadata_file} for version {next_version} was \
+                                     reported as existing but holds the bytes this commit sent, \
+                                     so the write landed: {error}"
+                                );
+                            }
+                            ExistingMetadataFile::Concurrent => {
+                                log::warn!(
+                                    "Metadata file {} already exists for version {}. Retrying attempt {}",
+                                    metadata_file,
+                                    next_version,
+                                    attempt
+                                );
+                                prepared_snapshot.publication_did_not_happen();
+                                prepared_snapshot.cleanup().await;
+                                if attempt >= MAX_COMMIT_RETRIES {
+                                    return Err(commit_conflict_error());
+                                }
+                                continue;
+                            }
                         }
-                        continue;
                     }
                     Err(error) => {
                         return Err(DataFusionError::External(Box::new(error)));
@@ -1976,13 +2000,43 @@ mod tests {
     enum MetadataWriteFault {
         Conflict(Bytes),
         LostAcknowledgement,
+        /// The write lands, its response is lost and the store's retry of the same request
+        /// reports that the file already exists.
+        LandedThenExists,
+        /// As [`Self::LandedThenExists`], and every later read of the file fails.
+        LandedThenExistsUnreadable,
+        /// The store reports that the file already exists, but it is gone when read.
+        ExistsThenMissing,
     }
 
     #[derive(Debug)]
     struct FaultInjectingMetadataStore {
         memory_store: Arc<object_store::memory::InMemory>,
         fault: MetadataWriteFault,
+        /// The suffix of the metadata file whose first write hits the fault.
+        fault_path: &'static str,
         fault_injected: AtomicBool,
+        deleted: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl FaultInjectingMetadataStore {
+        fn new(
+            memory_store: Arc<object_store::memory::InMemory>,
+            fault: MetadataWriteFault,
+            fault_path: &'static str,
+        ) -> Self {
+            Self {
+                memory_store,
+                fault,
+                fault_path,
+                fault_injected: AtomicBool::new(false),
+                deleted: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn deleted(&self) -> Vec<String> {
+            self.deleted.lock().expect("deleted paths").clone()
+        }
     }
 
     impl std::fmt::Display for FaultInjectingMetadataStore {
@@ -1999,9 +2053,14 @@ mod tests {
             payload: PutPayload,
             opts: PutOptions,
         ) -> object_store::Result<PutResult> {
-            if location.as_ref().ends_with("metadata/v2.metadata.json")
+            if location.as_ref().ends_with(self.fault_path)
                 && !self.fault_injected.swap(true, Ordering::SeqCst)
             {
+                let already_exists = || object_store::Error::AlreadyExists {
+                    path: location.to_string(),
+                    source: std::io::Error::other("412 Precondition Failed on a retried PUT")
+                        .into(),
+                };
                 match &self.fault {
                     MetadataWriteFault::Conflict(metadata) => {
                         self.memory_store
@@ -2016,6 +2075,12 @@ mod tests {
                                 .into(),
                         });
                     }
+                    MetadataWriteFault::LandedThenExists
+                    | MetadataWriteFault::LandedThenExistsUnreadable => {
+                        self.memory_store.put_opts(location, payload, opts).await?;
+                        return Err(already_exists());
+                    }
+                    MetadataWriteFault::ExistsThenMissing => return Err(already_exists()),
                 }
             }
             self.memory_store.put_opts(location, payload, opts).await
@@ -2034,6 +2099,15 @@ mod tests {
             location: &Path,
             options: GetOptions,
         ) -> object_store::Result<GetResult> {
+            if matches!(self.fault, MetadataWriteFault::LandedThenExistsUnreadable)
+                && self.fault_injected.load(Ordering::SeqCst)
+                && location.as_ref().ends_with(self.fault_path)
+            {
+                return Err(object_store::Error::Generic {
+                    store: "fault injection",
+                    source: std::io::Error::other("injected metadata read failure").into(),
+                });
+            }
             self.memory_store.get_opts(location, options).await
         }
 
@@ -2049,7 +2123,19 @@ mod tests {
             &self,
             locations: BoxStream<'static, object_store::Result<Path>>,
         ) -> BoxStream<'static, object_store::Result<Path>> {
-            self.memory_store.delete_stream(locations)
+            let deleted = Arc::clone(&self.deleted);
+            self.memory_store.delete_stream(
+                locations
+                    .inspect(move |location| {
+                        if let Ok(location) = location {
+                            deleted
+                                .lock()
+                                .expect("deleted paths")
+                                .push(location.to_string());
+                        }
+                    })
+                    .boxed(),
+            )
         }
 
         fn list(
@@ -2322,11 +2408,11 @@ mod tests {
                 .with_expected_snapshot_id(Some(None));
                 let context = SessionContext::new();
                 let publication_store: Arc<dyn ObjectStore> = if lose_acknowledgement {
-                    Arc::new(FaultInjectingMetadataStore {
-                        memory_store: memory.clone(),
-                        fault: MetadataWriteFault::LostAcknowledgement,
-                        fault_injected: AtomicBool::new(false),
-                    })
+                    Arc::new(FaultInjectingMetadataStore::new(
+                        memory.clone(),
+                        MetadataWriteFault::LostAcknowledgement,
+                        "metadata/v2.metadata.json",
+                    ))
                 } else {
                     memory.clone()
                 };
@@ -2519,11 +2605,11 @@ mod tests {
             .expect("memory input");
             let commit =
                 IcebergCommitExec::new(input, table_url, None, SnapshotUpdateKind::FastAppend);
-            let conflict_store = Arc::new(FaultInjectingMetadataStore {
-                memory_store: Arc::clone(&memory),
-                fault: MetadataWriteFault::Conflict(metadata_bytes),
-                fault_injected: AtomicBool::new(false),
-            });
+            let conflict_store = Arc::new(FaultInjectingMetadataStore::new(
+                Arc::clone(&memory),
+                MetadataWriteFault::Conflict(metadata_bytes),
+                "metadata/v2.metadata.json",
+            ));
             let context = SessionContext::new();
             context.runtime_env().register_object_store(
                 &Url::parse("file:///").expect("file store URL"),
@@ -2681,11 +2767,11 @@ mod tests {
                         "publication-1".to_string(),
                     )]),
             );
-            let conflict_store = Arc::new(FaultInjectingMetadataStore {
-                memory_store: Arc::clone(&memory),
-                fault: MetadataWriteFault::Conflict(concurrent_bytes.clone()),
-                fault_injected: AtomicBool::new(false),
-            });
+            let conflict_store = Arc::new(FaultInjectingMetadataStore::new(
+                Arc::clone(&memory),
+                MetadataWriteFault::Conflict(concurrent_bytes.clone()),
+                "metadata/v2.metadata.json",
+            ));
             let context = SessionContext::new();
             context.runtime_env().register_object_store(
                 &Url::parse("file:///").expect("file store URL"),
@@ -3467,6 +3553,296 @@ mod tests {
                     "an empty overwrite must not publish a snapshot"
                 );
             }
+        });
+    }
+
+    /// Where a path-table commit writes the metadata file whose create-only write hits a
+    /// fault.
+    #[derive(Debug, Clone, Copy)]
+    enum MetadataWriteSite {
+        /// A commit without table metadata bootstraps a new table in `v1`.
+        NewTableBootstrap,
+        /// A commit on empty table metadata `v1` bootstraps the first snapshot in `v2`.
+        FirstSnapshotBootstrap,
+        /// A commit on a table at snapshot metadata `v2` publishes `v3` on the normal path.
+        NextVersion,
+    }
+
+    impl MetadataWriteSite {
+        const ALL: [Self; 3] = [
+            Self::NewTableBootstrap,
+            Self::FirstSnapshotBootstrap,
+            Self::NextVersion,
+        ];
+
+        fn metadata_file(self) -> &'static str {
+            match self {
+                Self::NewTableBootstrap => "metadata/v1.metadata.json",
+                Self::FirstSnapshotBootstrap => "metadata/v2.metadata.json",
+                Self::NextVersion => "metadata/v3.metadata.json",
+            }
+        }
+    }
+
+    struct MetadataWriteFaultRun {
+        result: Result<Vec<RecordBatch>>,
+        store: Arc<FaultInjectingMetadataStore>,
+        memory: Arc<object_store::memory::InMemory>,
+        store_ctx: StoreContext,
+        table_url: Url,
+    }
+
+    impl MetadataWriteFaultRun {
+        /// The latest metadata file and the live data files with their row counts, after
+        /// loading every manifest list the metadata names and every manifest and data file
+        /// of its current snapshot.
+        async fn committed_table(&self) -> (String, Vec<(String, u64)>) {
+            let store: Arc<dyn ObjectStore> = self.memory.clone();
+            let location = crate::table::find_latest_metadata_file(&store, &self.table_url)
+                .await
+                .expect("latest metadata location");
+            let bytes = load_metadata_file_bytes(&store, &location)
+                .await
+                .expect("latest metadata bytes");
+            let metadata = TableMetadata::from_json(&bytes).expect("latest metadata");
+            for snapshot in &metadata.snapshots {
+                load_manifest_list(&self.store_ctx, snapshot.manifest_list())
+                    .await
+                    .expect("every snapshot names an existing manifest list");
+            }
+            let snapshot = metadata.current_snapshot().expect("current snapshot");
+            let manifests = load_manifest_list(&self.store_ctx, snapshot.manifest_list())
+                .await
+                .expect("current manifest list");
+            let mut files = Vec::new();
+            for manifest_file in manifests.entries() {
+                let manifest = load_manifest(&self.store_ctx, &manifest_file.manifest_path)
+                    .await
+                    .expect("current manifest");
+                for entry in manifest.entries().iter().filter(|entry| {
+                    matches!(
+                        entry.status,
+                        ManifestStatus::Added | ManifestStatus::Existing
+                    )
+                }) {
+                    self.store_ctx
+                        .prefixed
+                        .head(&Path::from(entry.data_file.file_path.as_str()))
+                        .await
+                        .expect("live data file");
+                    files.push((
+                        entry.data_file.file_path.clone(),
+                        entry.data_file.record_count,
+                    ));
+                }
+            }
+            files.sort();
+            (location, files)
+        }
+    }
+
+    fn append_actions(table_url: &Url, path: &str, rows: u64) -> RecordBatch {
+        let mut data_file = partitioned_data_file(path, 0, 0);
+        data_file.partition.clear();
+        data_file.record_count = rows;
+        datafusion::arrow::compute::concat_batches(
+            &iceberg_action_schema().expect("action schema"),
+            &[
+                encode_add_data_files(vec![data_file]).expect("add action"),
+                encode_commit_meta(CommitMeta {
+                    table_uri: table_url.to_string(),
+                    row_count: rows,
+                    table_properties: vec![("format-version".to_string(), "2".to_string())],
+                    schema: Some(
+                        IcebergSchema::builder()
+                            .with_fields([Arc::new(NestedField::required(
+                                1,
+                                "id",
+                                Type::Primitive(PrimitiveType::Int),
+                            ))])
+                            .build()
+                            .expect("schema"),
+                    ),
+                    ..Default::default()
+                })
+                .expect("commit metadata"),
+            ],
+        )
+        .expect("append actions")
+    }
+
+    /// Append `data/second.parquet` with three rows to a path table whose create-only write
+    /// of the metadata file at `site` hits `fault`. Before it, the table holds what the site
+    /// needs: nothing, empty metadata, or a snapshot with `data/first.parquet` and two rows.
+    async fn run_commit_with_metadata_write_fault(
+        site: MetadataWriteSite,
+        fault: MetadataWriteFault,
+    ) -> MetadataWriteFaultRun {
+        let table_url = Url::parse("file:///tmp/metadata-write-fault/").expect("table URL");
+        let memory = Arc::new(object_store::memory::InMemory::new());
+        let base_store: Arc<dyn ObjectStore> = memory.clone();
+        let store_ctx = StoreContext::new(base_store, &table_url).expect("store context");
+        let store = Arc::new(FaultInjectingMetadataStore::new(
+            Arc::clone(&memory),
+            fault,
+            site.metadata_file(),
+        ));
+        let context = SessionContext::new();
+        context.runtime_env().register_object_store(
+            &Url::parse("file:///").expect("file store URL"),
+            store.clone(),
+        );
+        if !matches!(site, MetadataWriteSite::NewTableBootstrap) {
+            crate::operations::bootstrap::bootstrap_empty_table_metadata(
+                &table_url,
+                &store_ctx,
+                IcebergSchema::builder()
+                    .with_fields([Arc::new(NestedField::required(
+                        1,
+                        "id",
+                        Type::Primitive(PrimitiveType::Int),
+                    ))])
+                    .build()
+                    .expect("schema"),
+                PartitionSpec::unpartitioned_spec(),
+                &[("format-version".to_string(), "2".to_string())],
+                NewTableMetadataStyle::Hadoop,
+            )
+            .await
+            .expect("empty table metadata");
+        }
+        if matches!(site, MetadataWriteSite::NextVersion) {
+            store_ctx
+                .prefixed
+                .put(
+                    &Path::from("data/first.parquet"),
+                    Bytes::from_static(b"first").into(),
+                )
+                .await
+                .expect("first data file");
+            datafusion::physical_plan::collect(
+                Arc::new(commit_plan(
+                    &table_url,
+                    append_actions(&table_url, "data/first.parquet", 2),
+                    SnapshotUpdateKind::FastAppend,
+                )),
+                context.task_ctx(),
+            )
+            .await
+            .expect("first append");
+        }
+        store_ctx
+            .prefixed
+            .put(
+                &Path::from("data/second.parquet"),
+                Bytes::from_static(b"second").into(),
+            )
+            .await
+            .expect("second data file");
+        let result = datafusion::physical_plan::collect(
+            Arc::new(commit_plan(
+                &table_url,
+                append_actions(&table_url, "data/second.parquet", 3),
+                SnapshotUpdateKind::FastAppend,
+            )),
+            context.task_ctx(),
+        )
+        .await;
+        assert!(
+            store.fault_injected.load(Ordering::SeqCst),
+            "{site:?}: the commit never wrote {}",
+            site.metadata_file()
+        );
+        MetadataWriteFaultRun {
+            result,
+            store,
+            memory,
+            store_ctx,
+            table_url,
+        }
+    }
+
+    /// The ways `run` differs from a commit that keeps every file of its landed write and
+    /// publishes `data/second.parquet` at `site`.
+    async fn landed_write_failures(
+        site: MetadataWriteSite,
+        run: &MetadataWriteFaultRun,
+    ) -> Vec<String> {
+        let batches = match &run.result {
+            Ok(batches) => batches,
+            Err(error) => {
+                return vec![format!(
+                    "{site:?}: a write that landed must commit: {error}"
+                )];
+            }
+        };
+        let mut failures = Vec::new();
+        if committed_count(batches) != Some(3) {
+            failures.push(format!("{site:?}: count {:?}", committed_count(batches)));
+        }
+        let deleted = run.store.deleted();
+        if !deleted.is_empty() {
+            failures.push(format!("{site:?}: deleted {deleted:?}"));
+        }
+        let (location, files) = run.committed_table().await;
+        if !location.ends_with(site.metadata_file()) {
+            failures.push(format!("{site:?}: latest metadata {location}"));
+        }
+        let mut expected = vec![("data/second.parquet".to_string(), 3)];
+        if matches!(site, MetadataWriteSite::NextVersion) {
+            expected.insert(0, ("data/first.parquet".to_string(), 2));
+        }
+        if files != expected {
+            failures.push(format!("{site:?}: live files {files:?}"));
+        }
+        failures
+    }
+
+    #[test]
+    fn metadata_write_that_landed_before_it_reported_a_conflict_commits() {
+        futures::executor::block_on(async {
+            let mut failures = Vec::new();
+            for site in MetadataWriteSite::ALL {
+                let run = run_commit_with_metadata_write_fault(
+                    site,
+                    MetadataWriteFault::LandedThenExists,
+                )
+                .await;
+                failures.extend(landed_write_failures(site, &run).await);
+            }
+            assert!(failures.is_empty(), "{failures:#?}");
+        });
+    }
+
+    #[test]
+    fn metadata_write_conflict_that_cannot_be_read_back_reports_unknown_state_and_deletes_nothing()
+    {
+        futures::executor::block_on(async {
+            let mut failures = Vec::new();
+            for site in MetadataWriteSite::ALL {
+                for fault in [
+                    MetadataWriteFault::LandedThenExistsUnreadable,
+                    MetadataWriteFault::ExistsThenMissing,
+                ] {
+                    let case = format!("{site:?}, {fault:?}");
+                    let run = run_commit_with_metadata_write_fault(site, fault).await;
+                    match &run.result {
+                        Ok(_) => failures.push(format!("{case}: an unconfirmed write committed")),
+                        Err(error) if !is_commit_state_unknown(error) => {
+                            failures.push(format!("{case}: not an unknown state: {error}"));
+                        }
+                        Err(error) if !error.to_string().contains(site.metadata_file()) => {
+                            failures.push(format!("{case}: the error names no path: {error}"));
+                        }
+                        Err(_) => {}
+                    }
+                    let deleted = run.store.deleted();
+                    if !deleted.is_empty() {
+                        failures.push(format!("{case}: deleted {deleted:?}"));
+                    }
+                }
+            }
+            assert!(failures.is_empty(), "{failures:#?}");
         });
     }
 }
