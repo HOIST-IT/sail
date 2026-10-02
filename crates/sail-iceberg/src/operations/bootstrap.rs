@@ -21,7 +21,6 @@ use std::sync::Arc;
 use bytes::Bytes;
 use datafusion_common::{DataFusionError, Result};
 use object_store::ObjectStoreExt;
-use sail_catalog::error::CatalogError;
 use url::Url;
 
 use crate::io::StoreContext;
@@ -67,17 +66,19 @@ pub struct BootstrapResult {
 impl BootstrapResult {
     /// Remove the bootstrap metadata file and every snapshot artifact created for it.
     ///
-    /// This fails closed: when the metadata file itself cannot be removed, the artifacts it
-    /// references are retained and the failure is reported as an unknown commit state.
+    /// Only a bootstrap whose catalog pointer update was never sent may be removed. Once the
+    /// update is sent, the catalog may reference the bootstrap even when the update reports an
+    /// error, so its artifacts are kept.
+    ///
+    /// The metadata file is removed first. When that fails, the artifacts it references are
+    /// retained so that it never names missing files.
     pub(crate) async fn cleanup(self, store_ctx: &StoreContext) -> Result<()> {
         let metadata_path = object_store::path::Path::from(self.metadata_file);
         match store_ctx.prefixed.delete(&metadata_path).await {
             Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
             Err(error) => {
-                return Err(DataFusionError::External(Box::new(
-                    CatalogError::CommitStateUnknown(format!(
-                        "failed to remove uncommitted Iceberg bootstrap metadata {metadata_path}; dependent artifacts were retained: {error}"
-                    )),
+                return Err(DataFusionError::Execution(format!(
+                    "failed to remove unpublished Iceberg bootstrap metadata {metadata_path}; dependent artifacts were retained: {error}"
                 )));
             }
         }
@@ -191,8 +192,9 @@ async fn publish_metadata_version(
     })
 }
 
-/// Publish bootstrap metadata and hand the snapshot artifacts to the result, so that a
-/// later failed catalog pointer update can still remove the uncommitted snapshot.
+/// Publish bootstrap metadata and hand the snapshot artifacts to the result, so that the
+/// caller can still remove the uncommitted snapshot when it never sends the catalog pointer
+/// update.
 async fn publish_bootstrap_snapshot(
     store_ctx: &StoreContext,
     mut prepared_snapshot: PreparedSnapshotCommit,
