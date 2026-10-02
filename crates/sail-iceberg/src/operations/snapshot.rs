@@ -482,8 +482,8 @@ impl PreparedSnapshotCommit {
     }
 
     /// Hand the created paths to the caller for deferred cleanup, disarming the drop guard.
-    /// Bootstrap uses this so that a later failed catalog commit can still remove the
-    /// uncommitted snapshot artifacts.
+    /// Bootstrap uses this so that it can still remove the uncommitted snapshot artifacts
+    /// when its catalog pointer update is never sent.
     pub(crate) fn into_created_paths(mut self) -> Vec<ObjectPath> {
         self.cleanup.cleanup_on_drop = false;
         std::mem::take(&mut self.cleanup.created_paths)
