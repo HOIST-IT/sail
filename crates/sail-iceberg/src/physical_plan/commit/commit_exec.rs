@@ -588,7 +588,7 @@ impl IcebergCommitExec {
     /// [`is_pointer_update_rejection`] decides. Every other outcome is an unknown commit state
     /// that names the new metadata location: a failed request that may still be in flight and
     /// apply later, a pointer that cannot be reloaded, a pointer that disappeared although the
-    /// update expected one, and current metadata that cannot be read.
+    /// update expected one or current metadata that cannot be read.
     ///
     /// The caller keeps every file the commit wrote whatever this returns. A pointer that does
     /// not reference them now does not prove that no catalog state ever will.
@@ -3692,6 +3692,21 @@ mod tests {
             let (metadata_files, manifest_lists) = fixture.written_artifacts().await;
             assert_eq!(metadata_files.len(), 2, "{metadata_files:?}");
             assert_eq!(manifest_lists.len(), 2, "{manifest_lists:?}");
+        });
+    }
+
+    #[test]
+    fn new_table_pointer_conflict_without_a_previous_location_reports_unknown_commit_state() {
+        futures::executor::block_on(async {
+            // A first pointer update compares against nothing, so a conflict cannot prove
+            // that this update did not apply.
+            let (result, fixture) =
+                run_bootstrap_with_pointer_fault(PointerUpdateFault::ConflictOnce, false).await;
+            let error = result.expect_err("an unconfirmed pointer update must fail the write");
+            assert!(is_commit_state_unknown(&error), "{error}");
+            assert_eq!(fixture.catalog.updates.load(Ordering::SeqCst), 1);
+            let (metadata_files, _) = fixture.written_artifacts().await;
+            assert_eq!(metadata_files.len(), 1, "{metadata_files:?}");
         });
     }
 
