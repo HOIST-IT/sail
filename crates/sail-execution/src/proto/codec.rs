@@ -6063,8 +6063,11 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_iceberg_deleted_row_count_uses_fail_closed_row_level_mode() -> Result<()> {
+    /// Encode an Iceberg row-level writer and return its plan node.
+    fn encode_iceberg_row_level_writer(
+        mode: sail_common_datafusion::datasource::RowLevelWriteMode,
+        count_deleted_rows: bool,
+    ) -> Result<r#gen::IcebergWriterExecNode> {
         use datafusion::arrow::datatypes::{DataType, Field};
         use datafusion::physical_plan::empty::EmptyExec;
         use sail_common_datafusion::datasource::{
@@ -6074,85 +6077,156 @@ mod tests {
         use sail_iceberg::spec::FormatVersion;
 
         let data_schema = Schema::new(vec![Field::new("id", DataType::Int64, true)]);
-        let input_schema = Arc::new(Schema::new(vec![
+        let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, true),
             Field::new(MERGE_FILE_COLUMN, DataType::Utf8, true),
             Field::new(OPERATION_COLUMN, DataType::Int32, false),
-        ]));
+        ]))));
         let table_url = Url::parse("file:///tmp/iceberg-delete-count-codec/")
             .map_err(|error| plan_datafusion_err!("{error}"))?;
-        // Decoders that predate deleted-row counting know only these values.
-        let legacy_modes = [
-            r#gen::IcebergRowLevelWriteMode::CopyOnWrite as i32,
-            r#gen::IcebergRowLevelWriteMode::MergeOnRead as i32,
-        ];
-        for count_deleted_rows in [false, true] {
-            let options = IcebergWriterExecOptions {
-                count_deleted_rows,
-                ..Default::default()
-            };
-            let mut write_context = sail_iceberg::physical_plan::prepare_iceberg_write_context(
-                &table_url,
-                None,
-                &options,
-                &[],
-                &PhysicalSinkMode::Append,
-                &data_schema,
-            )?;
-            write_context.base_table = Some(IcebergBaseWriteContext {
-                format_version: FormatVersion::V2,
-                partition_specs: vec![],
-                default_spec_id: 0,
-                properties: Default::default(),
-                last_column_id: 1,
-                current_schema_id: 0,
-                last_partition_id: 999,
-                current_snapshot_id: Some(42),
-            });
-            let plan: Arc<dyn ExecutionPlan> = Arc::new(IcebergWriterExec::new_copy_on_write(
-                Arc::new(EmptyExec::new(Arc::clone(&input_schema))),
-                table_url.clone(),
+        let options = IcebergWriterExecOptions {
+            count_deleted_rows,
+            ..Default::default()
+        };
+        let mut write_context = sail_iceberg::physical_plan::prepare_iceberg_write_context(
+            &table_url,
+            None,
+            &options,
+            &[],
+            &PhysicalSinkMode::Append,
+            &data_schema,
+        )?;
+        write_context.base_table = Some(IcebergBaseWriteContext {
+            format_version: FormatVersion::V2,
+            partition_specs: vec![],
+            default_spec_id: 0,
+            properties: Default::default(),
+            last_column_id: 1,
+            current_schema_id: 0,
+            last_partition_id: 999,
+            current_snapshot_id: Some(42),
+        });
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(match mode {
+            RowLevelWriteMode::CopyOnWrite => IcebergWriterExec::new_copy_on_write(
+                input,
+                table_url,
                 vec![],
                 options,
                 write_context,
-            )?);
+            )?,
+            RowLevelWriteMode::MergeOnRead => IcebergWriterExec::new_merge(
+                input,
+                table_url,
+                vec![],
+                PhysicalSinkMode::Append,
+                true,
+                options,
+                write_context,
+            )?,
+        });
 
-            let codec = RemoteExecutionCodec;
-            let mut bytes = Vec::new();
-            codec.try_encode(
-                plan,
-                &mut bytes,
-                &crate::proto::converter::RemotePhysicalProtoConverter::default(),
-            )?;
-            let extended = r#gen::ExtendedPhysicalPlanNode::decode(bytes.as_slice())
+        let mut bytes = Vec::new();
+        RemoteExecutionCodec.try_encode(
+            plan,
+            &mut bytes,
+            &crate::proto::converter::RemotePhysicalProtoConverter::default(),
+        )?;
+        let extended = r#gen::ExtendedPhysicalPlanNode::decode(bytes.as_slice())
+            .map_err(|error| plan_datafusion_err!("{error}"))?;
+        let Some(NodeKind::IcebergWriter(node)) = extended.node_kind else {
+            return plan_err!("encoded plan is not an IcebergWriterExec");
+        };
+        Ok(node)
+    }
+
+    /// Decode an Iceberg writer node into its row-level mode and whether it counts deleted rows.
+    fn decode_iceberg_row_level_writer(
+        node: r#gen::IcebergWriterExecNode,
+    ) -> Result<(
+        Option<sail_common_datafusion::datasource::RowLevelWriteMode>,
+        bool,
+    )> {
+        let node = ExtendedPhysicalPlanNode {
+            node_kind: Some(NodeKind::IcebergWriter(node)),
+        };
+        let decoded = RemoteExecutionCodec.try_decode(
+            &node.encode_to_vec(),
+            &[],
+            &TaskContext::default(),
+            &crate::proto::converter::RemotePhysicalProtoConverter::default(),
+        )?;
+        let writer = decoded
+            .downcast_ref::<IcebergWriterExec>()
+            .ok_or_else(|| plan_datafusion_err!("decoded plan is not an IcebergWriterExec"))?;
+        Ok((writer.row_level_mode(), writer.options().count_deleted_rows))
+    }
+
+    #[test]
+    fn test_iceberg_deleted_row_count_uses_fail_closed_row_level_mode() -> Result<()> {
+        use r#gen::IcebergRowLevelWriteMode as Wire;
+        use sail_common_datafusion::datasource::RowLevelWriteMode;
+
+        for (mode, count_deleted_rows, expected) in [
+            (RowLevelWriteMode::CopyOnWrite, false, Wire::CopyOnWrite),
+            (RowLevelWriteMode::MergeOnRead, false, Wire::MergeOnRead),
+            // Decoders that predate deleted-row counting reject these values, so a counting
+            // writer never reaches a worker that would report another count.
+            (
+                RowLevelWriteMode::CopyOnWrite,
+                true,
+                Wire::CopyOnWriteCountingDeletedRows,
+            ),
+            (
+                RowLevelWriteMode::MergeOnRead,
+                true,
+                Wire::MergeOnReadCountingDeletedRows,
+            ),
+        ] {
+            let case = format!("{mode:?}, count_deleted_rows={count_deleted_rows}");
+            let node = encode_iceberg_row_level_writer(mode, count_deleted_rows)?;
+            assert_eq!(node.row_level_mode, Some(expected as i32), "{case}");
+            assert_eq!(
+                decode_iceberg_row_level_writer(node)?,
+                (Some(mode), count_deleted_rows),
+                "{case}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_iceberg_row_level_write_mode_or_option_requests_deleted_row_count() -> Result<()> {
+        use r#gen::IcebergRowLevelWriteMode as Wire;
+        use sail_common_datafusion::datasource::RowLevelWriteMode;
+
+        for (wire_mode, option, mode) in [
+            // A driver built before the counting modes requests the count only in the options.
+            (Wire::CopyOnWrite, true, RowLevelWriteMode::CopyOnWrite),
+            (Wire::MergeOnRead, true, RowLevelWriteMode::MergeOnRead),
+            // The counting modes request the count without the option.
+            (
+                Wire::CopyOnWriteCountingDeletedRows,
+                false,
+                RowLevelWriteMode::CopyOnWrite,
+            ),
+            (
+                Wire::MergeOnReadCountingDeletedRows,
+                false,
+                RowLevelWriteMode::MergeOnRead,
+            ),
+        ] {
+            let case = format!("{wire_mode:?}, count_deleted_rows option {option}");
+            let mut node = encode_iceberg_row_level_writer(mode, false)?;
+            node.row_level_mode = Some(wire_mode as i32);
+            let mut options: serde_json::Value = serde_json::from_str(&node.options)
                 .map_err(|error| plan_datafusion_err!("{error}"))?;
-            let Some(NodeKind::IcebergWriter(node)) = extended.node_kind else {
-                return plan_err!("encoded plan is not an IcebergWriterExec");
-            };
-            let encoded_mode = node
-                .row_level_mode
-                .ok_or_else(|| plan_datafusion_err!("missing row-level write mode"))?;
-            // A counting writer must not reach a worker that would report another count.
+            options["count_deleted_rows"] = serde_json::Value::Bool(option);
+            node.options = options.to_string();
             assert_eq!(
-                legacy_modes.contains(&encoded_mode),
-                !count_deleted_rows,
-                "count_deleted_rows={count_deleted_rows} encoded mode {encoded_mode}"
+                decode_iceberg_row_level_writer(node)?,
+                (Some(mode), true),
+                "{case}"
             );
-
-            let decoded = codec.try_decode(
-                &bytes,
-                &[],
-                &TaskContext::default(),
-                &crate::proto::converter::RemotePhysicalProtoConverter::default(),
-            )?;
-            let writer = decoded
-                .downcast_ref::<IcebergWriterExec>()
-                .ok_or_else(|| plan_datafusion_err!("decoded plan is not an IcebergWriterExec"))?;
-            assert_eq!(
-                writer.row_level_mode(),
-                Some(RowLevelWriteMode::CopyOnWrite)
-            );
-            assert_eq!(writer.options().count_deleted_rows, count_deleted_rows);
         }
         Ok(())
     }
