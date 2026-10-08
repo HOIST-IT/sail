@@ -130,6 +130,20 @@ async fn discard_unsent_bootstrap(
     }
 }
 
+/// The catalog entry of a filesystem-mode table, in which a commit records the metadata
+/// location of its new head.
+struct FilesystemCatalogRegistration<'a> {
+    catalog_table: &'a [String],
+    table_properties: &'a [(String, String)],
+    /// The metadata location recorded for the table when the write was planned, else the one
+    /// the catalog held when the commit started.
+    recorded_metadata_location: Option<&'a str>,
+    /// Whether the commit built on the metadata the catalog pointer names instead of the
+    /// metadata directory listing. That happens only when the planned table properties mark
+    /// the table as catalog managed while its catalog entry at commit time does not.
+    builds_on_catalog_pointer: bool,
+}
+
 /// What a catalog metadata pointer update did.
 #[derive(Debug)]
 enum PointerUpdateOutcome {
@@ -538,7 +552,75 @@ impl IcebergCommitExec {
             .await
     }
 
-    /// Point the catalog at metadata that is already written.
+    /// Record in the catalog the metadata a filesystem-mode commit has written.
+    ///
+    /// Readers of a filesystem-mode table find its head by listing the metadata directory, so
+    /// a commit that built on that listing landed once its metadata file was written, and the
+    /// catalog only records that head. A registration that fails or that the catalog refuses,
+    /// such as a compare-and-swap conflict against a stale recorded location, therefore does
+    /// not fail the commit: a caller that retried it would append the same rows twice. It is
+    /// logged as a warning.
+    ///
+    /// A commit that built on the metadata the catalog pointer names did not read the listing,
+    /// so its metadata file is not known to be the head that readers find. It publishes the
+    /// pointer with [`Self::publish_catalog_pointer`] instead and reports a refusal.
+    async fn register_filesystem_metadata_location(
+        context: &Arc<TaskContext>,
+        object_store: &Arc<dyn object_store::ObjectStore>,
+        registration: &FilesystemCatalogRegistration<'_>,
+        table_url: &Url,
+        metadata_file: &str,
+        new_snapshot_id: Option<i64>,
+    ) -> Result<()> {
+        if registration.builds_on_catalog_pointer {
+            let new_metadata_location = Self::table_metadata_location(table_url, metadata_file)?;
+            return match Self::publish_catalog_pointer(
+                context,
+                object_store,
+                registration.catalog_table,
+                registration.table_properties,
+                registration.recorded_metadata_location,
+                &new_metadata_location,
+                new_snapshot_id,
+            )
+            .await?
+            {
+                PointerUpdateOutcome::Committed => Ok(()),
+                PointerUpdateOutcome::Rejected(error) => Err(error),
+            };
+        }
+        let table = registration.catalog_table.join(".");
+        let new_metadata_location = match Self::table_metadata_location(table_url, metadata_file) {
+            Ok(location) => location,
+            Err(error) => {
+                log::warn!(
+                    "Iceberg table {table} committed metadata file {metadata_file} but its \
+                     location could not be resolved to record in the catalog; the metadata \
+                     directory stays the source of truth: {error}"
+                );
+                return Ok(());
+            }
+        };
+        if let Err(error) = Self::update_catalog_metadata_location(
+            context,
+            registration.catalog_table,
+            registration.table_properties,
+            registration.recorded_metadata_location,
+            &new_metadata_location,
+        )
+        .await
+        {
+            log::warn!(
+                "Iceberg table {table} committed metadata {new_metadata_location} but recording \
+                 it in the catalog failed; the metadata directory stays the source of truth: \
+                 {error}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Point the catalog at metadata that is already written, when the commit built on the
+    /// metadata the catalog pointer names.
     ///
     /// An update that reports an error is reconciled with [`Self::reconcile_pointer_update`],
     /// because the request was sent and may have applied. The caller keeps every file the
@@ -1061,9 +1143,15 @@ impl ExecutionPlan for IcebergCommitExec {
             let catalog_metadata_update_table = catalog_table
                 .as_ref()
                 .filter(|_| catalog_commit_mode.uses_metadata_location_update());
-            let catalog_registered_metadata_table = catalog_table
-                .as_ref()
-                .filter(|_| matches!(catalog_commit_mode, IcebergCatalogCommitMode::Filesystem));
+            let filesystem_registration = catalog_table
+                .as_deref()
+                .filter(|_| matches!(catalog_commit_mode, IcebergCatalogCommitMode::Filesystem))
+                .map(|catalog_table| FilesystemCatalogRegistration {
+                    catalog_table,
+                    table_properties: &commit_info.table_properties,
+                    recorded_metadata_location: catalog_recorded_metadata_location.as_deref(),
+                    builds_on_catalog_pointer: catalog_metadata_location.is_some(),
+                });
             log::debug!(
                 "Iceberg catalog commit context: table={:?}, metadata_location={:?}, mode={:?}",
                 catalog_table,
@@ -1125,25 +1213,16 @@ impl ExecutionPlan for IcebergCommitExec {
                         NewTableMetadataStyle::Hadoop,
                     )
                     .await?;
-                    if let Some(catalog_table) = catalog_registered_metadata_table {
-                        let new_metadata_location = Self::table_metadata_location(
-                            &table_url,
-                            &bootstrap_result.metadata_file,
-                        )?;
-                        match Self::publish_catalog_pointer(
+                    if let Some(registration) = &filesystem_registration {
+                        Self::register_filesystem_metadata_location(
                             &context,
                             &object_store,
-                            catalog_table,
-                            &commit_info.table_properties,
-                            catalog_recorded_metadata_location.as_deref(),
-                            &new_metadata_location,
+                            registration,
+                            &table_url,
+                            &bootstrap_result.metadata_file,
                             bootstrap_result.table_metadata.current_snapshot_id,
                         )
-                        .await?
-                        {
-                            PointerUpdateOutcome::Committed => {}
-                            PointerUpdateOutcome::Rejected(error) => return Err(error),
-                        }
+                        .await?;
                     }
                 }
 
@@ -1443,25 +1522,16 @@ impl ExecutionPlan for IcebergCommitExec {
                             }
                             PointerUpdateOutcome::Rejected(error) => return Err(error),
                         }
-                    } else if let Some(catalog_table) = catalog_registered_metadata_table {
-                        let new_metadata_location = Self::table_metadata_location(
-                            &table_url,
-                            &bootstrap_result.metadata_file,
-                        )?;
-                        match Self::publish_catalog_pointer(
+                    } else if let Some(registration) = &filesystem_registration {
+                        Self::register_filesystem_metadata_location(
                             &context,
                             &object_store,
-                            catalog_table,
-                            &commit_info.table_properties,
-                            catalog_recorded_metadata_location.as_deref(),
-                            &new_metadata_location,
+                            registration,
+                            &table_url,
+                            &bootstrap_result.metadata_file,
                             bootstrap_result.table_metadata.current_snapshot_id,
                         )
-                        .await?
-                        {
-                            PointerUpdateOutcome::Committed => {}
-                            PointerUpdateOutcome::Rejected(error) => return Err(error),
-                        }
+                        .await?;
                     }
 
                     return commit_count_batch(schema, commit_info.row_count);
@@ -1786,21 +1856,15 @@ impl ExecutionPlan for IcebergCommitExec {
                 write_version_hint(&store_ctx.prefixed, &version_hint).await;
 
                 // The metadata file is written and nothing of this commit is deleted from here
-                // on, so a pointer update that reports an error is reconciled, not cleaned up.
-                let pointer_update = if let Some(catalog_table) = catalog_metadata_update_table {
-                    Some((catalog_table, catalog_metadata_location.as_deref()))
-                } else {
-                    catalog_registered_metadata_table.map(|catalog_table| {
-                        (catalog_table, catalog_recorded_metadata_location.as_deref())
-                    })
-                };
-                if let Some((catalog_table, previous_metadata_location)) = pointer_update {
+                // on. A pointer update that reports an error is reconciled, not cleaned up, and
+                // a filesystem-mode registration handles its own failure.
+                if let Some(catalog_table) = catalog_metadata_update_table {
                     match Self::publish_catalog_pointer(
                         &context,
                         &object_store,
                         catalog_table,
                         &commit_info.table_properties,
-                        previous_metadata_location,
+                        catalog_metadata_location.as_deref(),
                         &metadata_location,
                         table_meta.current_snapshot_id,
                     )
@@ -1809,6 +1873,16 @@ impl ExecutionPlan for IcebergCommitExec {
                         PointerUpdateOutcome::Committed => {}
                         PointerUpdateOutcome::Rejected(error) => return Err(error),
                     }
+                } else if let Some(registration) = &filesystem_registration {
+                    Self::register_filesystem_metadata_location(
+                        &context,
+                        &object_store,
+                        registration,
+                        &table_url,
+                        &metadata_file,
+                        table_meta.current_snapshot_id,
+                    )
+                    .await?;
                 }
 
                 return commit_count_batch(schema, commit_info.row_count);
@@ -3209,7 +3283,50 @@ mod tests {
         }
     }
 
+    /// Where readers of a [`pointer_fixture`] table find its head.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum PointerMode {
+        /// The catalog pointer is the head, and a commit moves it with a compare-and-swap update.
+        CatalogPointer,
+        /// The metadata directory listing is the head, and a commit records it in the catalog.
+        FilesystemRegistered,
+        /// A filesystem-mode table whose write was planned as catalog managed while its catalog
+        /// entry is not. Readers list the metadata directory, but a commit builds on the
+        /// metadata the catalog pointer names and moves the pointer with a compare-and-swap
+        /// update.
+        FilesystemOnCatalogPointer,
+    }
+
+    impl PointerMode {
+        fn authority(self) -> LakehouseAuthority {
+            match self {
+                Self::CatalogPointer => LakehouseAuthority::CatalogAuthoritative {
+                    lifecycle: TableLifecycle::External,
+                    pointer: MetadataPointerAuthority::CatalogPropertyCas,
+                    commit: CommitAuthority::IcebergMetadataLocationCas,
+                },
+                Self::FilesystemRegistered | Self::FilesystemOnCatalogPointer => {
+                    LakehouseAuthority::CatalogRegistered {
+                        lifecycle: TableLifecycle::External,
+                        pointer: MetadataPointerAuthority::StorageDiscovery,
+                        commit: CommitAuthority::Filesystem,
+                    }
+                }
+            }
+        }
+
+        /// The table properties a write is planned with.
+        fn table_properties(self) -> Vec<(String, String)> {
+            let mut properties = vec![("format-version".to_string(), "2".to_string())];
+            if self == Self::FilesystemOnCatalogPointer {
+                properties.push(("table_type".to_string(), "ICEBERG".to_string()));
+            }
+            properties
+        }
+    }
+
     struct PointerFixture {
+        mode: PointerMode,
         memory: Arc<object_store::memory::InMemory>,
         catalog: Arc<PointerFaultCatalog>,
         database: Namespace,
@@ -3277,10 +3394,21 @@ mod tests {
             catalog_table_info_from_status(&status).metadata_location
         }
 
-        /// The sorted data files of the table the catalog names, loading every file on the way.
+        /// The sorted data files of the table head, loading every file on the way. Like a
+        /// reader, this finds the head through the catalog pointer, or through the metadata
+        /// directory listing in filesystem mode.
         async fn committed_data_files(&self) -> Vec<String> {
-            let location = self.catalog_pointer().await.expect("published pointer");
             let store: Arc<dyn ObjectStore> = self.memory.clone();
+            let location = match self.mode {
+                PointerMode::CatalogPointer => {
+                    self.catalog_pointer().await.expect("published pointer")
+                }
+                PointerMode::FilesystemRegistered | PointerMode::FilesystemOnCatalogPointer => {
+                    crate::table::find_latest_metadata_file(&store, &self.table_url)
+                        .await
+                        .expect("listed metadata")
+                }
+            };
             let bytes = load_metadata_file_bytes(&store, &location)
                 .await
                 .expect("published metadata");
@@ -3328,12 +3456,16 @@ mod tests {
         }
     }
 
-    /// A catalog table whose metadata pointer updates hit `fault`.
+    /// A catalog table in `mode` whose metadata pointer updates hit `fault`.
     ///
     /// Without existing metadata a commit bootstraps a new table. With it, the catalog already
     /// names empty table metadata and a commit bootstraps the first snapshot inside its
-    /// compare-and-swap retry loop.
-    async fn pointer_fixture(fault: PointerUpdateFault, existing_metadata: bool) -> PointerFixture {
+    /// retry loop.
+    async fn pointer_fixture(
+        mode: PointerMode,
+        fault: PointerUpdateFault,
+        existing_metadata: bool,
+    ) -> PointerFixture {
         let table_url = Url::parse(POINTER_TABLE_URL).expect("table URL");
         let memory = Arc::new(object_store::memory::InMemory::new());
         let store: Arc<dyn ObjectStore> = memory.clone();
@@ -3347,7 +3479,7 @@ mod tests {
             ))])
             .build()
             .expect("schema");
-        let table_properties = vec![("format-version".to_string(), "2".to_string())];
+        let table_properties = mode.table_properties();
         let initial_metadata_location = if existing_metadata {
             let empty = crate::operations::bootstrap::bootstrap_empty_table_metadata(
                 &table_url,
@@ -3431,11 +3563,7 @@ mod tests {
             },
             LakehouseOperation::Write,
             LakehouseFormat::Iceberg,
-            LakehouseAuthority::CatalogAuthoritative {
-                lifecycle: TableLifecycle::External,
-                pointer: MetadataPointerAuthority::CatalogPropertyCas,
-                commit: CommitAuthority::IcebergMetadataLocationCas,
-            },
+            mode.authority(),
             ScanAuthority::ClientLakeSource,
         );
         let mut state = datafusion::execution::SessionStateBuilder::new().build();
@@ -3447,6 +3575,7 @@ mod tests {
         );
 
         let mut fixture = PointerFixture {
+            mode,
             memory,
             catalog,
             database,
@@ -3466,10 +3595,11 @@ mod tests {
     /// Bootstrap a catalog table whose metadata pointer update hits `fault`, as described on
     /// [`pointer_fixture`].
     async fn run_bootstrap_with_pointer_fault(
+        mode: PointerMode,
         fault: PointerUpdateFault,
         existing_metadata: bool,
     ) -> (Result<Vec<RecordBatch>>, PointerFixture) {
-        let fixture = pointer_fixture(fault, existing_metadata).await;
+        let fixture = pointer_fixture(mode, fault, existing_metadata).await;
         let result = fixture.commit(POINTER_DATA_FILE).await;
         (result, fixture)
     }
@@ -3477,9 +3607,10 @@ mod tests {
     /// Append to a catalog table that already has a snapshot, so that the commit takes the
     /// normal path and its metadata pointer update hits `fault`.
     async fn run_append_with_pointer_fault(
+        mode: PointerMode,
         fault: PointerUpdateFault,
     ) -> (Result<Vec<RecordBatch>>, PointerFixture) {
-        let mut fixture = pointer_fixture(fault, true).await;
+        let mut fixture = pointer_fixture(mode, fault, true).await;
         fixture.catalog.armed.store(false, Ordering::SeqCst);
         fixture
             .commit(POINTER_DATA_FILE)
@@ -3519,8 +3650,12 @@ mod tests {
                     PointerUpdateFault::AppliedResponseLost,
                     PointerUpdateFault::AppliedThenAdvanced,
                 ] {
-                    let (result, fixture) =
-                        run_bootstrap_with_pointer_fault(fault, existing_metadata).await;
+                    let (result, fixture) = run_bootstrap_with_pointer_fault(
+                        PointerMode::CatalogPointer,
+                        fault,
+                        existing_metadata,
+                    )
+                    .await;
                     let case = format!("{fault:?}, existing metadata {existing_metadata}");
                     assert!(
                         result.is_ok(),
@@ -3559,19 +3694,20 @@ mod tests {
     /// Run every commit path whose pointer update hits `fault`: a bootstrap without and with
     /// existing metadata, then an append on the normal path.
     async fn run_pointer_update_cases(
+        mode: PointerMode,
         fault: PointerUpdateFault,
     ) -> Vec<(String, Result<Vec<RecordBatch>>, PointerFixture)> {
         let mut cases = Vec::new();
         for existing_metadata in [false, true] {
             let (result, fixture) =
-                run_bootstrap_with_pointer_fault(fault, existing_metadata).await;
+                run_bootstrap_with_pointer_fault(mode, fault, existing_metadata).await;
             cases.push((
                 format!("bootstrap, existing metadata {existing_metadata}"),
                 result,
                 fixture,
             ));
         }
-        let (result, fixture) = run_append_with_pointer_fault(fault).await;
+        let (result, fixture) = run_append_with_pointer_fault(mode, fault).await;
         cases.push(("append".to_string(), result, fixture));
         cases
     }
@@ -3579,8 +3715,11 @@ mod tests {
     #[test]
     fn timed_out_pointer_update_that_the_catalog_does_not_reflect_reports_unknown_commit_state() {
         futures::executor::block_on(async {
-            for (case, result, fixture) in
-                run_pointer_update_cases(PointerUpdateFault::NotApplied).await
+            for (case, result, fixture) in run_pointer_update_cases(
+                PointerMode::CatalogPointer,
+                PointerUpdateFault::NotApplied,
+            )
+            .await
             {
                 let error = result.expect_err("an unconfirmed pointer update must fail the write");
                 // The request may still be in flight, so a caller retry could commit twice.
@@ -3605,7 +3744,8 @@ mod tests {
     fn refused_pointer_update_reports_the_error_and_keeps_the_files() {
         futures::executor::block_on(async {
             for (case, result, fixture) in
-                run_pointer_update_cases(PointerUpdateFault::Refused).await
+                run_pointer_update_cases(PointerMode::CatalogPointer, PointerUpdateFault::Refused)
+                    .await
             {
                 let error = result.expect_err("a refused pointer update must fail the write");
                 assert!(!is_commit_state_unknown(&error), "{case}: {error}");
@@ -3634,7 +3774,8 @@ mod tests {
                 PointerUpdateFault::AppliedResponseLost,
                 PointerUpdateFault::AppliedThenAdvanced,
             ] {
-                let (result, fixture) = run_append_with_pointer_fault(fault).await;
+                let (result, fixture) =
+                    run_append_with_pointer_fault(PointerMode::CatalogPointer, fault).await;
                 assert!(
                     result.is_ok(),
                     "{fault:?}: an applied update must commit: {:?}",
@@ -3659,6 +3800,7 @@ mod tests {
         futures::executor::block_on(async {
             for existing_metadata in [false, true] {
                 let (result, fixture) = run_bootstrap_with_pointer_fault(
+                    PointerMode::CatalogPointer,
                     PointerUpdateFault::AppliedThenReloadFails,
                     existing_metadata,
                 )
@@ -3680,8 +3822,12 @@ mod tests {
     #[test]
     fn retried_bootstrap_pointer_conflict_keeps_the_files_of_the_lost_attempt() {
         futures::executor::block_on(async {
-            let (result, fixture) =
-                run_bootstrap_with_pointer_fault(PointerUpdateFault::ConflictOnce, true).await;
+            let (result, fixture) = run_bootstrap_with_pointer_fault(
+                PointerMode::CatalogPointer,
+                PointerUpdateFault::ConflictOnce,
+                true,
+            )
+            .await;
             let batches = result.expect("the retry must commit");
             assert_eq!(committed_count(&batches), Some(3));
             assert_eq!(fixture.catalog.updates.load(Ordering::SeqCst), 2);
@@ -3700,8 +3846,12 @@ mod tests {
         futures::executor::block_on(async {
             // A first pointer update compares against nothing, so a conflict cannot prove
             // that this update did not apply.
-            let (result, fixture) =
-                run_bootstrap_with_pointer_fault(PointerUpdateFault::ConflictOnce, false).await;
+            let (result, fixture) = run_bootstrap_with_pointer_fault(
+                PointerMode::CatalogPointer,
+                PointerUpdateFault::ConflictOnce,
+                false,
+            )
+            .await;
             let error = result.expect_err("an unconfirmed pointer update must fail the write");
             assert!(is_commit_state_unknown(&error), "{error}");
             assert_eq!(fixture.catalog.updates.load(Ordering::SeqCst), 1);
@@ -3714,6 +3864,7 @@ mod tests {
     fn bootstrap_pointer_conflict_whose_table_goes_missing_reports_unknown_commit_state() {
         futures::executor::block_on(async {
             let (result, fixture) = run_bootstrap_with_pointer_fault(
+                PointerMode::CatalogPointer,
                 PointerUpdateFault::ConflictThenTableMissing,
                 true,
             )
@@ -3731,6 +3882,7 @@ mod tests {
     fn commit_retry_without_a_catalog_pointer_does_not_build_on_the_metadata_listing() {
         futures::executor::block_on(async {
             let (result, fixture) = run_bootstrap_with_pointer_fault(
+                PointerMode::CatalogPointer,
                 PointerUpdateFault::ConflictThenTableMissingOnRetry,
                 true,
             )
@@ -3748,6 +3900,88 @@ mod tests {
                 fixture.catalog_pointer().await,
                 fixture.initial_metadata_location
             );
+        });
+    }
+
+    #[test]
+    fn filesystem_registration_that_fails_after_a_durable_write_commits() {
+        futures::executor::block_on(async {
+            // A caller that retried a write reported as failed would append its rows twice.
+            for fault in [
+                PointerUpdateFault::Refused,
+                PointerUpdateFault::NotApplied,
+                PointerUpdateFault::ConflictOnce,
+            ] {
+                for (path, result, fixture) in
+                    run_pointer_update_cases(PointerMode::FilesystemRegistered, fault).await
+                {
+                    let case = format!("{fault:?}, {path}");
+                    // Readers list the metadata directory, so the write landed with its file.
+                    assert!(
+                        result.is_ok(),
+                        "{case}: a durable write must commit: {:?}",
+                        result.as_ref().err()
+                    );
+                    let batches = result.expect("committed write");
+                    assert_eq!(committed_count(&batches), Some(3), "{case}");
+                    let mut expected = vec![POINTER_DATA_FILE.to_string()];
+                    if path == "append" {
+                        expected.insert(0, APPENDED_DATA_FILE.to_string());
+                    }
+                    assert_eq!(fixture.committed_data_files().await, expected, "{case}");
+                    assert_eq!(
+                        fixture.catalog_pointer().await,
+                        fixture.initial_metadata_location,
+                        "{case}"
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn filesystem_commit_built_on_the_catalog_pointer_keeps_the_reconciled_pointer_update() {
+        futures::executor::block_on(async {
+            // The commit did not build on the listing, so its metadata file is not known to be
+            // the head, and only the pointer update decides whether it committed.
+            let mode = PointerMode::FilesystemOnCatalogPointer;
+            for fault in [
+                PointerUpdateFault::Refused,
+                PointerUpdateFault::AppliedResponseLost,
+            ] {
+                let cases = vec![
+                    (
+                        "bootstrap",
+                        run_bootstrap_with_pointer_fault(mode, fault, true).await,
+                    ),
+                    ("append", run_append_with_pointer_fault(mode, fault).await),
+                ];
+                for (path, (result, fixture)) in cases {
+                    let case = format!("{fault:?}, {path}");
+                    let pointer = fixture.catalog_pointer().await;
+                    if fault == PointerUpdateFault::Refused {
+                        let error =
+                            result.expect_err("a refused pointer update must fail the write");
+                        assert!(!is_commit_state_unknown(&error), "{case}: {error}");
+                        assert!(
+                            error.to_string().contains("not allowed to alter the table"),
+                            "{case}: {error}"
+                        );
+                        assert_eq!(pointer, fixture.initial_metadata_location, "{case}");
+                    } else {
+                        let batches = result.expect("an applied pointer update must commit");
+                        assert_eq!(committed_count(&batches), Some(3), "{case}");
+                        let (metadata_files, _) = fixture.written_artifacts().await;
+                        assert_eq!(metadata_files.len(), 1, "{case}: {metadata_files:?}");
+                        assert!(
+                            pointer
+                                .as_deref()
+                                .is_some_and(|pointer| pointer.ends_with(&metadata_files[0])),
+                            "{case}: {pointer:?}"
+                        );
+                    }
+                }
+            }
         });
     }
 
