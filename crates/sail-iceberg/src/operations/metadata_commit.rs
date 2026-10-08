@@ -75,6 +75,11 @@ impl MetadataFileCommit {
         &self.location
     }
 
+    /// The metadata file path relative to the table location.
+    pub(crate) fn file(&self) -> &str {
+        self.path.as_ref()
+    }
+
     /// Only definite conflicts may be retried; other errors can leave publication uncertain.
     pub(crate) async fn write(&self, store: &StoreContext) -> Result<MetadataWriteOutcome> {
         match store
