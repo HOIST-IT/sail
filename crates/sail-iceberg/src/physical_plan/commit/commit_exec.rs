@@ -147,10 +147,10 @@ struct FilesystemCatalogRegistration<'a> {
 /// What a catalog metadata pointer update did.
 #[derive(Debug)]
 enum PointerUpdateOutcome {
-    /// The catalog references the new snapshot, so the write committed.
+    /// The catalog head is the new metadata or was built on it, so the write committed.
     Committed,
-    /// The catalog refused the update and does not reference the new snapshot, so the update
-    /// can never apply. Carries the update error.
+    /// The catalog refused the update and its head neither is nor was built on the new
+    /// metadata, so the update can never apply. Carries the update error.
     Rejected(DataFusionError),
 }
 
@@ -664,7 +664,9 @@ impl IcebergCommitExec {
     /// The update can apply even though its response is lost, and a retried request can then
     /// report a conflict against its own write. The catalog pointer is reloaded: the update
     /// applied when the pointer names the new metadata location, or when the metadata it names
-    /// contains the new snapshot because another writer already committed on top of it.
+    /// shows that another writer already committed on top of it. That metadata then contains
+    /// the new snapshot, or its metadata log lists the new metadata location once a snapshot
+    /// expiry removed that snapshot.
     ///
     /// Otherwise the update is reported as rejected only when the catalog refused it, as
     /// [`is_pointer_update_rejection`] decides. Every other outcome is an unknown commit state
@@ -705,10 +707,16 @@ impl IcebergCommitExec {
                                 .map_err(|error| DataFusionError::External(Box::new(error)))
                         });
                     match current_metadata {
-                        Ok(metadata) => metadata
-                            .snapshots
-                            .iter()
-                            .any(|snapshot| snapshot.snapshot_id() == snapshot_id),
+                        Ok(metadata) => {
+                            metadata
+                                .snapshots
+                                .iter()
+                                .any(|snapshot| snapshot.snapshot_id() == snapshot_id)
+                                || metadata
+                                    .metadata_log
+                                    .iter()
+                                    .any(|entry| entry.metadata_file == new_metadata_location)
+                        }
                         Err(load_error) => {
                             return Err(pointer_update_state_unknown(
                                 new_metadata_location,
@@ -736,7 +744,7 @@ impl IcebergCommitExec {
         if committed {
             log::warn!(
                 "Iceberg catalog pointer update to {new_metadata_location} reported an error but \
-                 the catalog references the new snapshot: {error}"
+                 the catalog head is the new metadata or was built on it: {error}"
             );
             Ok(PointerUpdateOutcome::Committed)
         } else if is_pointer_update_rejection(&error, previous_metadata_location.is_some()) {
@@ -745,8 +753,8 @@ impl IcebergCommitExec {
             Err(pointer_update_state_unknown(
                 new_metadata_location,
                 &error,
-                "the catalog pointer does not reference the new snapshot, but the request may \
-                 still apply"
+                "the catalog pointer does not reference the new metadata or its snapshot, but the \
+                 request may still apply"
                     .to_string(),
             ))
         }
@@ -1955,6 +1963,7 @@ mod tests {
     use crate::physical_plan::action_schema::{
         encode_add_data_files, encode_commit_meta, iceberg_action_schema,
     };
+    use crate::spec::metadata::table_metadata::MetadataLog;
     use crate::spec::transform::Transform;
     use crate::spec::types::values::{Literal, PrimitiveLiteral};
     use crate::spec::types::{NestedField, PrimitiveType, Type};
@@ -2995,8 +3004,13 @@ mod tests {
     enum PointerUpdateFault {
         /// The update applies, then its response is lost.
         AppliedResponseLost,
-        /// The update applies, another writer commits on top of it, then the response is lost.
+        /// The update applies, another writer commits on top of it and keeps its snapshot, then
+        /// the response is lost. The new metadata log does not name the update, as when the
+        /// writer records locations in another form or trims the log.
         AppliedThenAdvanced,
+        /// The update applies, another writer commits on top of it, names it in the metadata
+        /// log and expires its snapshot, then the response is lost.
+        AppliedThenAdvancedAndExpired,
         /// The update applies, its response is lost and every later catalog read fails.
         AppliedThenReloadFails,
         /// The update applies, then the request times out.
@@ -3049,12 +3063,15 @@ mod tests {
         }
 
         /// Commit another snapshot on top of the metadata at `location`, as a concurrent
-        /// writer would, and move the pointer to it.
+        /// writer would, and move the pointer to it. With `expire`, the commit names `location`
+        /// in its metadata log and expires the snapshot that was current there, so only the log
+        /// still shows that it was built on `location`.
         async fn advance(
             &self,
             database: &Namespace,
             table: &str,
             location: &str,
+            expire: bool,
         ) -> CatalogResult<()> {
             let store: Arc<dyn ObjectStore> = self.memory_store.clone();
             let bytes = load_metadata_file_bytes(&store, location)
@@ -3089,6 +3106,18 @@ mod tests {
                 },
             );
             metadata.snapshots.push(snapshot);
+            if expire {
+                metadata.metadata_log.push(MetadataLog {
+                    timestamp_ms: metadata.last_updated_ms,
+                    metadata_file: location.to_string(),
+                });
+                metadata
+                    .snapshots
+                    .retain(|snapshot| snapshot.snapshot_id() != parent.snapshot_id());
+                metadata
+                    .snapshot_log
+                    .retain(|entry| entry.snapshot_id != parent.snapshot_id());
+            }
             let json = metadata.to_json().expect("advanced metadata JSON");
             let path = metadata_location_to_object_path_string(ADVANCED_METADATA_LOCATION)
                 .expect("advanced metadata path");
@@ -3237,13 +3266,20 @@ mod tests {
                 }
                 PointerUpdateFault::AppliedResponseLost
                 | PointerUpdateFault::AppliedThenAdvanced
+                | PointerUpdateFault::AppliedThenAdvancedAndExpired
                 | PointerUpdateFault::AppliedThenReloadFails
                 | PointerUpdateFault::AppliedThenTimedOut => {
                     self.inner.alter_table(database, table, options).await?;
-                    if self.fault == PointerUpdateFault::AppliedThenAdvanced {
+                    if matches!(
+                        self.fault,
+                        PointerUpdateFault::AppliedThenAdvanced
+                            | PointerUpdateFault::AppliedThenAdvancedAndExpired
+                    ) {
                         let location = metadata_location_update(&properties)
                             .expect("updated metadata location");
-                        self.advance(database, table, location).await?;
+                        let expire =
+                            self.fault == PointerUpdateFault::AppliedThenAdvancedAndExpired;
+                        self.advance(database, table, location, expire).await?;
                     }
                     if self.fault == PointerUpdateFault::AppliedThenReloadFails {
                         self.reads_fail.store(true, Ordering::SeqCst);
@@ -3773,6 +3809,8 @@ mod tests {
                 // A retried request conflicts with the update it already applied.
                 PointerUpdateFault::AppliedResponseLost,
                 PointerUpdateFault::AppliedThenAdvanced,
+                // Only the metadata log of the advanced metadata still names the update.
+                PointerUpdateFault::AppliedThenAdvancedAndExpired,
             ] {
                 let (result, fixture) =
                     run_append_with_pointer_fault(PointerMode::CatalogPointer, fault).await;
