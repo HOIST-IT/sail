@@ -45,6 +45,7 @@ pub struct IcebergPlanBuilder<'a> {
     snapshot_properties: Vec<(String, String)>,
     removed_data_file_paths: Vec<String>,
     dynamic_partition_overwrite: bool,
+    preserve_input_partitions: bool,
     #[expect(unused)]
     session: &'a dyn Session,
 }
@@ -67,6 +68,7 @@ impl<'a> IcebergPlanBuilder<'a> {
             snapshot_properties: Vec::new(),
             removed_data_file_paths: Vec::new(),
             dynamic_partition_overwrite: false,
+            preserve_input_partitions: false,
             session,
         }
     }
@@ -96,6 +98,13 @@ impl<'a> IcebergPlanBuilder<'a> {
         self
     }
 
+    /// Keep the input partitioning through the write, including the sort for the table's
+    /// write order, so each input partition is written by its own task.
+    pub fn preserve_input_partitions(mut self) -> Self {
+        self.preserve_input_partitions = true;
+        self
+    }
+
     /// Build the write plan.
     ///
     /// There is no repartition layer. Writer parallelism follows the input plan, the same
@@ -109,6 +118,12 @@ impl<'a> IcebergPlanBuilder<'a> {
             .and_then(|plan| self.add_sort_node(plan))
             .and_then(|plan| self.add_writer_node(plan))
             .and_then(|plan| self.add_commit_node(plan))
+    }
+
+    pub async fn build_writer(self) -> Result<Arc<dyn ExecutionPlan>> {
+        self.add_projection_node(self.input.clone())
+            .and_then(|plan| self.add_sort_node(plan))
+            .and_then(|plan| self.add_writer_node(plan))
     }
 
     fn add_projection_node(&self, input: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
@@ -164,6 +179,9 @@ impl<'a> IcebergPlanBuilder<'a> {
         let mut columns = Vec::new();
         if let Some(spec) = &context.writer_partition_spec {
             for field in spec.fields() {
+                if field.transform == crate::spec::Transform::Void {
+                    continue;
+                }
                 let path = context
                     .writer_schema
                     .field_path_by_id(field.source_id)
@@ -192,7 +210,10 @@ impl<'a> IcebergPlanBuilder<'a> {
                 let lex = LexOrdering::new(sort_exprs).ok_or_else(|| {
                     datafusion::common::DataFusionError::Internal("Invalid sort order".to_string())
                 })?;
-                Ok(Arc::new(SortExec::new(lex, input)))
+                Ok(Arc::new(
+                    SortExec::new(lex, input)
+                        .with_preserve_partitioning(self.preserve_input_partitions),
+                ))
             }
             _ => Ok(input),
         }

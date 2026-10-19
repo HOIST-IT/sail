@@ -280,6 +280,7 @@ pub enum SnapshotUpdateKind {
     FullOverwrite,
     RowDelta,
     CopyOnWrite,
+    RewriteDataFiles,
     /// Row-level COW actions classified from files added and removed at runtime.
     RowLevelRewrite,
 }
@@ -353,6 +354,7 @@ impl SnapshotUpdateKind {
                 Operation::Overwrite
             }
             Self::CopyOnWrite | Self::RowLevelRewrite => Operation::Delete,
+            Self::RewriteDataFiles => Operation::Replace,
         }
     }
 
@@ -361,7 +363,10 @@ impl SnapshotUpdateKind {
     }
 
     pub(crate) fn is_targeted_rewrite(self) -> bool {
-        matches!(self, Self::CopyOnWrite | Self::RowLevelRewrite)
+        matches!(
+            self,
+            Self::CopyOnWrite | Self::RowLevelRewrite | Self::RewriteDataFiles
+        )
     }
 
     fn delete_totals_base<'a>(
@@ -1573,7 +1578,8 @@ mod tests {
             }"#,
         )
         .expect("nullable manifest list schema");
-        let mut writer = apache_avro::Writer::new(&schema, Vec::new());
+        let mut writer =
+            apache_avro::Writer::new(&schema, Vec::new()).expect("nullable manifest list writer");
         writer
             .append_ser(NullableManifestCounts {
                 manifest_path,

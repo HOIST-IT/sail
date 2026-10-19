@@ -487,7 +487,9 @@ mod tests {
             sort_order_id: None,
             iceberg_schema: Arc::new(iceberg_schema),
             partition_spec: UnboundPartitionSpec {
+                spec_id: None,
                 fields: vec![UnboundPartitionField {
+                    field_id: None,
                     source_id: 2,
                     name: "part".to_string(),
                     transform: Transform::Identity,
