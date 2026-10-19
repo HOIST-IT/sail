@@ -12,7 +12,8 @@ use crate::table::metadata_loader::{
     write_version_hint,
 };
 use crate::utils::metadata::{
-    ExistingMetadataFile, metadata_files_for_version, reconcile_existing_metadata_file,
+    ExistingMetadataFile, commit_state_unknown, failed_metadata_write, metadata_file_location,
+    metadata_files_for_version, reconcile_existing_metadata_file,
 };
 
 #[derive(Clone, Copy)]
@@ -80,7 +81,13 @@ impl MetadataFileCommit {
         self.path.as_ref()
     }
 
-    /// Only definite conflicts may be retried; other errors can leave publication uncertain.
+    /// Only definite conflicts may be retried.
+    ///
+    /// A versioned file publishes the commit as soon as it exists, so once its write may
+    /// have been sent, every error is an unknown commit state and nothing is removed. A
+    /// uniquely named file is published only by a later catalog pointer update, which the
+    /// caller never sends after an error, so a put error other than `AlreadyExists` is a
+    /// plain error for it.
     pub(crate) async fn write(&self, store: &StoreContext) -> Result<MetadataWriteOutcome> {
         match store
             .prefixed
@@ -113,17 +120,41 @@ impl MetadataFileCommit {
                     }
                 }
             }
-            Err(error) => return Err(DataFusionError::External(Box::new(error))),
+            Err(error) => {
+                return Err(match self.style {
+                    MetadataFileStyle::Versioned => failed_metadata_write(store, &self.path, error),
+                    MetadataFileStyle::Unique => DataFusionError::External(Box::new(error)),
+                });
+            }
         }
         if matches!(self.style, MetadataFileStyle::Versioned) {
-            let version_files = metadata_files_for_version(store, self.version).await?;
-            if version_files.iter().any(|file| file != self.path.as_ref()) {
+            let version_files = match metadata_files_for_version(store, self.version).await {
+                Ok(files) => files,
+                Err(error) => {
+                    return Err(commit_state_unknown(format!(
+                        "Iceberg metadata file {} was written, and listing metadata version {} \
+                         to check for a concurrent writer failed: {error}; no files were removed",
+                        metadata_file_location(store, &self.path),
+                        self.version
+                    )));
+                }
+            };
+            let concurrent_files = version_files
+                .iter()
+                .filter(|file| *file != self.path.as_ref())
+                .map(|file| metadata_file_location(store, &Path::from(file.as_str())).to_string())
+                .collect::<Vec<_>>();
+            if !concurrent_files.is_empty() {
                 match store.prefixed.delete(&self.path).await {
                     Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
                     Err(error) => {
-                        return Err(DataFusionError::Execution(format!(
-                            "failed to remove conflicted Iceberg metadata file {}; commit state is uncertain: {error}",
-                            self.path
+                        return Err(commit_state_unknown(format!(
+                            "Iceberg metadata file {} was written beside {} for metadata \
+                             version {}, and removing it failed: {error}; no other files were \
+                             removed",
+                            metadata_file_location(store, &self.path),
+                            concurrent_files.join(", "),
+                            self.version
                         )));
                     }
                 }
