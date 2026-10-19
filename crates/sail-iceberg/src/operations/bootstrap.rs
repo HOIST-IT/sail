@@ -37,7 +37,9 @@ use crate::table::metadata_loader::{
     write_version_hint,
 };
 use crate::utils::WritePathMode;
-use crate::utils::metadata::{ExistingMetadataFile, reconcile_existing_metadata_file};
+use crate::utils::metadata::{
+    ExistingMetadataFile, failed_metadata_write, reconcile_existing_metadata_file,
+};
 
 /// Strategy for persisting metadata during bootstrap
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,6 +121,7 @@ struct PreparedMetadataVersion {
     version_hint: String,
     metadata_path: object_store::path::Path,
     metadata_bytes: Vec<u8>,
+    metadata_style: NewTableMetadataStyle,
 }
 
 fn initial_metadata_version(metadata_style: NewTableMetadataStyle) -> i32 {
@@ -157,6 +160,7 @@ fn prepare_metadata_version(
         version_hint,
         metadata_path,
         metadata_bytes,
+        metadata_style,
     })
 }
 
@@ -170,6 +174,7 @@ async fn publish_metadata_version(
         version_hint,
         metadata_path,
         metadata_bytes,
+        metadata_style,
     } = prepared;
     // A create-only put keeps a concurrent writer's metadata version from being replaced.
     let metadata_bytes = Bytes::from(metadata_bytes);
@@ -203,7 +208,17 @@ async fn publish_metadata_version(
                 }
             }
         }
-        Err(error) => return Err(DataFusionError::External(Box::new(error))),
+        // A Hadoop-style file publishes the table version as soon as it exists, while a
+        // catalog-style file is published only by a catalog update that is never sent after
+        // this error.
+        Err(error) => {
+            return Err(match metadata_style {
+                NewTableMetadataStyle::Hadoop => {
+                    failed_metadata_write(store_ctx, &metadata_path, error)
+                }
+                NewTableMetadataStyle::Uuid => DataFusionError::External(Box::new(error)),
+            });
+        }
     }
     write_version_hint(&store_ctx.prefixed, &version_hint).await;
 

@@ -2198,6 +2198,13 @@ mod tests {
         LandedThenExistsUnreadable,
         /// The store reports that the file already exists, but it is gone when read.
         ExistsThenMissing,
+        /// The write lands and every later listing fails.
+        LandedThenUnlistable,
+        /// The write lands beside another writer's gzip file of the same version, and
+        /// removing the written file fails.
+        LandedBesideConcurrentThenUndeletable,
+        /// The store refuses the create-only put before it sends a request.
+        RefusedBeforeSending,
     }
 
     #[derive(Debug)]
@@ -2272,6 +2279,21 @@ mod tests {
                         return Err(already_exists());
                     }
                     MetadataWriteFault::ExistsThenMissing => return Err(already_exists()),
+                    MetadataWriteFault::RefusedBeforeSending => {
+                        return Err(object_store::Error::NotImplemented {
+                            operation: "put_opts with PutMode::Create".to_string(),
+                            implementer: "fault injection".to_string(),
+                        });
+                    }
+                    MetadataWriteFault::LandedThenUnlistable => {}
+                    MetadataWriteFault::LandedBesideConcurrentThenUndeletable => {
+                        let concurrent = location
+                            .as_ref()
+                            .replace(".metadata.json", ".gz.metadata.json");
+                        self.memory_store
+                            .put(&Path::from(concurrent), PutPayload::from_static(b"{}"))
+                            .await?;
+                    }
                 }
             }
             self.memory_store.put_opts(location, payload, opts).await
@@ -2315,8 +2337,26 @@ mod tests {
             locations: BoxStream<'static, object_store::Result<Path>>,
         ) -> BoxStream<'static, object_store::Result<Path>> {
             let deleted = Arc::clone(&self.deleted);
+            let undeletable = matches!(
+                self.fault,
+                MetadataWriteFault::LandedBesideConcurrentThenUndeletable
+            )
+            .then_some(self.fault_path);
             self.memory_store.delete_stream(
                 locations
+                    .map(move |location| match location {
+                        Ok(location)
+                            if undeletable
+                                .is_some_and(|path| location.as_ref().ends_with(path)) =>
+                        {
+                            Err(object_store::Error::Generic {
+                                store: "fault injection",
+                                source: std::io::Error::other("injected metadata delete failure")
+                                    .into(),
+                            })
+                        }
+                        location => location,
+                    })
                     .inspect(move |location| {
                         if let Ok(location) = location {
                             deleted
@@ -2333,6 +2373,17 @@ mod tests {
             &self,
             prefix: Option<&Path>,
         ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            if matches!(self.fault, MetadataWriteFault::LandedThenUnlistable)
+                && self.fault_injected.load(Ordering::SeqCst)
+            {
+                return futures::stream::once(async {
+                    Err(object_store::Error::Generic {
+                        store: "fault injection",
+                        source: std::io::Error::other("injected metadata listing failure").into(),
+                    })
+                })
+                .boxed();
+            }
             self.memory_store.list(prefix)
         }
 
@@ -4425,31 +4476,65 @@ mod tests {
     }
 
     #[test]
-    fn metadata_write_conflict_that_cannot_be_read_back_reports_unknown_state_and_deletes_nothing()
-    {
+    fn metadata_write_refused_before_sending_is_an_ordinary_error() {
         futures::executor::block_on(async {
             let mut failures = Vec::new();
             for site in MetadataWriteSite::ALL {
-                for fault in [
-                    MetadataWriteFault::LandedThenExistsUnreadable,
-                    MetadataWriteFault::ExistsThenMissing,
-                ] {
-                    let case = format!("{site:?}, {fault:?}");
-                    let run = run_commit_with_metadata_write_fault(site, fault).await;
-                    match &run.result {
-                        Ok(_) => failures.push(format!("{case}: an unconfirmed write committed")),
-                        Err(error) if !is_commit_state_unknown(error) => {
-                            failures.push(format!("{case}: not an unknown state: {error}"));
-                        }
-                        Err(error) if !error.to_string().contains(site.metadata_file()) => {
-                            failures.push(format!("{case}: the error names no path: {error}"));
-                        }
-                        Err(_) => {}
+                let run = run_commit_with_metadata_write_fault(
+                    site,
+                    MetadataWriteFault::RefusedBeforeSending,
+                )
+                .await;
+                match &run.result {
+                    Ok(_) => failures.push(format!("{site:?}: a refused write committed")),
+                    Err(error) if is_commit_state_unknown(error) => {
+                        failures.push(format!("{site:?}: an unknown state: {error}"));
                     }
-                    let deleted = run.store.deleted();
-                    if !deleted.is_empty() {
-                        failures.push(format!("{case}: deleted {deleted:?}"));
+                    Err(error) if !error.to_string().contains("not yet implemented") => {
+                        failures.push(format!("{site:?}: not the refusal: {error}"));
                     }
+                    Err(_) => {}
+                }
+            }
+            assert!(failures.is_empty(), "{failures:#?}");
+        });
+    }
+
+    #[test]
+    fn unconfirmed_metadata_write_reports_unknown_state_and_deletes_nothing() {
+        futures::executor::block_on(async {
+            let mut cases = Vec::new();
+            for site in MetadataWriteSite::ALL {
+                cases.push((site, MetadataWriteFault::LandedThenExistsUnreadable));
+                cases.push((site, MetadataWriteFault::ExistsThenMissing));
+                cases.push((site, MetadataWriteFault::LostAcknowledgement));
+            }
+            // Only a commit on existing metadata lists its version for a concurrent file.
+            cases.push((
+                MetadataWriteSite::NextVersion,
+                MetadataWriteFault::LandedThenUnlistable,
+            ));
+            cases.push((
+                MetadataWriteSite::NextVersion,
+                MetadataWriteFault::LandedBesideConcurrentThenUndeletable,
+            ));
+            let mut failures = Vec::new();
+            for (site, fault) in cases {
+                let case = format!("{site:?}, {fault:?}");
+                let run = run_commit_with_metadata_write_fault(site, fault).await;
+                match &run.result {
+                    Ok(_) => failures.push(format!("{case}: an unconfirmed write committed")),
+                    Err(error) if !is_commit_state_unknown(error) => {
+                        failures.push(format!("{case}: not an unknown state: {error}"));
+                    }
+                    Err(error) if !error.to_string().contains(site.metadata_file()) => {
+                        failures.push(format!("{case}: the error names no path: {error}"));
+                    }
+                    Err(_) => {}
+                }
+                let deleted = run.store.deleted();
+                if !deleted.is_empty() {
+                    failures.push(format!("{case}: deleted {deleted:?}"));
                 }
             }
             assert!(failures.is_empty(), "{failures:#?}");

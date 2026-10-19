@@ -57,18 +57,53 @@ pub(crate) async fn reconcile_existing_metadata_file(
         Ok(existing) if existing.as_ref() == written => Ok(ExistingMetadataFile::Written),
         Ok(_) => Ok(ExistingMetadataFile::Concurrent),
         Err(error) => {
-            let location = store_ctx
-                .prefix_path
-                .parts()
-                .chain(path.parts())
-                .collect::<object_store::path::Path>();
-            Err(DataFusionError::External(Box::new(
-                CatalogError::CommitStateUnknown(format!(
-                    "the create-only write of Iceberg metadata file {location} reported that the \
-                     file already exists, and the file could not be read to tell whether this \
-                     write created it: {error}; no files were removed"
-                )),
+            let location = metadata_file_location(store_ctx, path);
+            Err(commit_state_unknown(format!(
+                "the create-only write of Iceberg metadata file {location} reported that the \
+                 file already exists, and the file could not be read to tell whether this \
+                 write created it: {error}; no files were removed"
             )))
         }
+    }
+}
+
+/// The full object path of the table metadata file at `path`, for error messages.
+pub(crate) fn metadata_file_location(
+    store_ctx: &StoreContext,
+    path: &object_store::path::Path,
+) -> object_store::path::Path {
+    store_ctx.prefix_path.parts().chain(path.parts()).collect()
+}
+
+/// Fail a metadata write whose outcome cannot be confirmed, with a message that names the
+/// file. The caller must not delete anything, because the file may be visible and name the
+/// files of this commit.
+pub(crate) fn commit_state_unknown(message: String) -> DataFusionError {
+    DataFusionError::External(Box::new(CatalogError::CommitStateUnknown(message)))
+}
+
+/// The error for a create-only write of the metadata file at `path` that failed with anything
+/// but `AlreadyExists`, for a file that publishes its table version as soon as it exists.
+///
+/// A store refuses some writes before it sends a request, for example a create-only put that
+/// it does not implement, and then nothing landed. After any other error the request may have
+/// landed, for example when its response was lost, so the commit state is unknown.
+pub(crate) fn failed_metadata_write(
+    store_ctx: &StoreContext,
+    path: &object_store::path::Path,
+    error: object_store::Error,
+) -> DataFusionError {
+    match error {
+        object_store::Error::NotImplemented { .. }
+        | object_store::Error::NotSupported { .. }
+        | object_store::Error::InvalidPath { .. }
+        | object_store::Error::UnknownConfigurationKey { .. } => {
+            DataFusionError::External(Box::new(error))
+        }
+        error => commit_state_unknown(format!(
+            "the create-only write of Iceberg metadata file {} failed and may have landed: \
+             {error}; no files were removed",
+            metadata_file_location(store_ctx, path)
+        )),
     }
 }
