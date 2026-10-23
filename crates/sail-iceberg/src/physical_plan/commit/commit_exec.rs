@@ -246,7 +246,8 @@ fn pointer_update_state_unknown(
     DataFusionError::External(Box::new(CatalogError::CommitStateUnknown(format!(
         "Iceberg catalog pointer update to {new_metadata_location} failed ({error}) and {detail}; \
          the metadata file and its snapshot files were kept"
-    ))))
+    )
+    .into())))
 }
 
 #[derive(Debug)]

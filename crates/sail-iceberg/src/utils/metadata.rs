@@ -79,7 +79,7 @@ pub(crate) fn metadata_file_location(
 /// file. The caller must not delete anything, because the file may be visible and name the
 /// files of this commit.
 pub(crate) fn commit_state_unknown(message: String) -> DataFusionError {
-    DataFusionError::External(Box::new(CatalogError::CommitStateUnknown(message)))
+    DataFusionError::External(Box::new(CatalogError::CommitStateUnknown(message.into())))
 }
 
 /// The error for a create-only write of the metadata file at `path` that failed with anything
