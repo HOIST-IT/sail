@@ -127,6 +127,7 @@ data:
   added-position-deletes: '1'
   added-records: '2'
   operation: overwrite
+  sail.commit-id: <commit-id>
   total-data-files: '3'
   total-delete-files: '1'
   total-equality-deletes: '0'
@@ -295,6 +296,7 @@ data:
   added-position-deletes: '3'
   added-records: '3'
   operation: overwrite
+  sail.commit-id: <commit-id>
   total-data-files: '6'
   total-delete-files: '3'
   total-equality-deletes: '0'
@@ -399,6 +401,7 @@ data:
       added-data-files: '5'
       added-records: '5'
       operation: append
+      sail.commit-id: <commit-id>
       total-data-files: '5'
       total-delete-files: '0'
       total-equality-deletes: '0'
@@ -417,6 +420,7 @@ data:
       added-position-deletes: '4'
       added-records: '3'
       operation: overwrite
+      sail.commit-id: <commit-id>
       total-data-files: '8'
       total-delete-files: '4'
       total-equality-deletes: '0'
@@ -503,6 +507,7 @@ data:
   added-position-deletes: '4'
   added-records: '3'
   operation: overwrite
+  sail.commit-id: <commit-id>
   total-data-files: '8'
   total-delete-files: '4'
   total-equality-deletes: '0'

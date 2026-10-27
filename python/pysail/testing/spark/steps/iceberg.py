@@ -437,6 +437,10 @@ def overwrite_partitions_of_iceberg_table(
     spark.sql(docstring).writeTo(table_name).overwritePartitions()
 
 
+# A random id per statement that every snapshot a Sail write publishes carries.
+ICEBERG_COMMIT_ID_SUMMARY_KEY = "sail.commit-id"
+
+
 def _sanitize_iceberg_metadata(metadata: dict) -> dict:
     """Sanitize volatile fields in Iceberg metadata for snapshot comparison."""
     sanitized = dict(metadata)
@@ -583,6 +587,8 @@ def _sanitize_iceberg_snapshot(snapshot: dict) -> dict:
         for key in list(summary.keys()):
             if key.endswith(("-ms", "-time-ms", "-duration-ms")):
                 summary[key] = "<time-ms>"
+            elif key == ICEBERG_COMMIT_ID_SUMMARY_KEY:
+                summary[key] = "<commit-id>"
             # Sanitize file paths in summary
             elif "path" in key.lower():
                 summary[key] = re.sub(
@@ -608,6 +614,8 @@ def _sanitize_iceberg_snapshot_summary(snapshot: dict) -> dict:
     for key in list(summary.keys()):
         if key.endswith(("-ms", "-time-ms", "-duration-ms")):
             summary[key] = "<time-ms>"
+        elif key == ICEBERG_COMMIT_ID_SUMMARY_KEY:
+            summary[key] = "<commit-id>"
 
     return summary
 

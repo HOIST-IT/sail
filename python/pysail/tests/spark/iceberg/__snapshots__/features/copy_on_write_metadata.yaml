@@ -61,6 +61,7 @@ data:
       added-data-files: '1'
       added-records: '1'
       operation: append
+      sail.commit-id: <commit-id>
       total-data-files: '1'
       total-delete-files: '0'
       total-equality-deletes: '0'
@@ -77,6 +78,7 @@ data:
       deleted-data-files: '0'
       deleted-records: '0'
       operation: append
+      sail.commit-id: <commit-id>
       total-data-files: '2'
       total-delete-files: '0'
       total-equality-deletes: '0'
@@ -126,6 +128,7 @@ data:
   deleted-data-files: '0'
   deleted-records: '0'
   operation: append
+  sail.commit-id: <commit-id>
   total-data-files: '2'
   total-delete-files: '0'
   total-equality-deletes: '0'
@@ -183,6 +186,7 @@ data:
       added-data-files: '1'
       added-records: '1'
       operation: append
+      sail.commit-id: <commit-id>
       total-data-files: '1'
       total-delete-files: '0'
       total-equality-deletes: '0'
@@ -200,6 +204,7 @@ data:
       deleted-data-files: '0'
       deleted-records: '0'
       operation: append
+      sail.commit-id: <commit-id>
       total-data-files: '2'
       total-delete-files: '0'
       total-equality-deletes: '0'
@@ -252,6 +257,7 @@ data:
   deleted-data-files: '0'
   deleted-records: '0'
   operation: append
+  sail.commit-id: <commit-id>
   total-data-files: '2'
   total-delete-files: '0'
   total-equality-deletes: '0'
@@ -339,6 +345,7 @@ data:
       added-data-files: '1'
       added-records: '2'
       operation: append
+      sail.commit-id: <commit-id>
       total-data-files: '1'
       total-delete-files: '0'
       total-equality-deletes: '0'
@@ -353,6 +360,7 @@ data:
       added-data-files: '1'
       added-records: '2'
       operation: append
+      sail.commit-id: <commit-id>
       total-data-files: '2'
       total-delete-files: '0'
       total-equality-deletes: '0'
@@ -369,6 +377,7 @@ data:
       deleted-data-files: '1'
       deleted-records: '2'
       operation: overwrite
+      sail.commit-id: <commit-id>
       total-data-files: '2'
       total-delete-files: '0'
       total-equality-deletes: '0'
@@ -451,6 +460,7 @@ data:
   deleted-data-files: '1'
   deleted-records: '2'
   operation: overwrite
+  sail.commit-id: <commit-id>
   total-data-files: '2'
   total-delete-files: '0'
   total-equality-deletes: '0'
@@ -538,6 +548,7 @@ data:
       added-data-files: '1'
       added-records: '2'
       operation: append
+      sail.commit-id: <commit-id>
       total-data-files: '1'
       total-delete-files: '0'
       total-equality-deletes: '0'
@@ -552,6 +563,7 @@ data:
       added-data-files: '1'
       added-records: '2'
       operation: append
+      sail.commit-id: <commit-id>
       total-data-files: '2'
       total-delete-files: '0'
       total-equality-deletes: '0'
@@ -568,6 +580,7 @@ data:
       deleted-data-files: '1'
       deleted-records: '2'
       operation: overwrite
+      sail.commit-id: <commit-id>
       total-data-files: '2'
       total-delete-files: '0'
       total-equality-deletes: '0'
@@ -650,6 +663,7 @@ data:
   deleted-data-files: '1'
   deleted-records: '2'
   operation: overwrite
+  sail.commit-id: <commit-id>
   total-data-files: '2'
   total-delete-files: '0'
   total-equality-deletes: '0'
@@ -737,6 +751,7 @@ data:
       added-data-files: '1'
       added-records: '2'
       operation: append
+      sail.commit-id: <commit-id>
       total-data-files: '1'
       total-delete-files: '0'
       total-equality-deletes: '0'
@@ -751,6 +766,7 @@ data:
       added-data-files: '1'
       added-records: '2'
       operation: append
+      sail.commit-id: <commit-id>
       total-data-files: '2'
       total-delete-files: '0'
       total-equality-deletes: '0'
@@ -767,6 +783,7 @@ data:
       deleted-data-files: '1'
       deleted-records: '2'
       operation: overwrite
+      sail.commit-id: <commit-id>
       total-data-files: '2'
       total-delete-files: '0'
       total-equality-deletes: '0'
@@ -849,6 +866,7 @@ data:
   deleted-data-files: '1'
   deleted-records: '2'
   operation: overwrite
+  sail.commit-id: <commit-id>
   total-data-files: '2'
   total-delete-files: '0'
   total-equality-deletes: '0'
@@ -918,6 +936,7 @@ data:
       added-data-files: '1'
       added-records: '2'
       operation: append
+      sail.commit-id: <commit-id>
       total-data-files: '1'
       total-delete-files: '0'
       total-equality-deletes: '0'
@@ -933,6 +952,7 @@ data:
       added-data-files: '1'
       added-records: '2'
       operation: append
+      sail.commit-id: <commit-id>
       total-data-files: '2'
       total-delete-files: '0'
       total-equality-deletes: '0'
@@ -950,6 +970,7 @@ data:
       deleted-data-files: '1'
       deleted-records: '2'
       operation: overwrite
+      sail.commit-id: <commit-id>
       total-data-files: '2'
       total-delete-files: '0'
       total-equality-deletes: '0'
@@ -1035,6 +1056,7 @@ data:
   deleted-data-files: '1'
   deleted-records: '2'
   operation: overwrite
+  sail.commit-id: <commit-id>
   total-data-files: '2'
   total-delete-files: '0'
   total-equality-deletes: '0'
@@ -1104,6 +1126,7 @@ data:
       added-data-files: '1'
       added-records: '2'
       operation: append
+      sail.commit-id: <commit-id>
       total-data-files: '1'
       total-delete-files: '0'
       total-equality-deletes: '0'
@@ -1119,6 +1142,7 @@ data:
       added-data-files: '1'
       added-records: '2'
       operation: append
+      sail.commit-id: <commit-id>
       total-data-files: '2'
       total-delete-files: '0'
       total-equality-deletes: '0'
@@ -1136,6 +1160,7 @@ data:
       deleted-data-files: '1'
       deleted-records: '2'
       operation: overwrite
+      sail.commit-id: <commit-id>
       total-data-files: '2'
       total-delete-files: '0'
       total-equality-deletes: '0'
@@ -1221,6 +1246,7 @@ data:
   deleted-data-files: '1'
   deleted-records: '2'
   operation: overwrite
+  sail.commit-id: <commit-id>
   total-data-files: '2'
   total-delete-files: '0'
   total-equality-deletes: '0'
@@ -1290,6 +1316,7 @@ data:
       added-data-files: '1'
       added-records: '2'
       operation: append
+      sail.commit-id: <commit-id>
       total-data-files: '1'
       total-delete-files: '0'
       total-equality-deletes: '0'
@@ -1305,6 +1332,7 @@ data:
       added-data-files: '1'
       added-records: '2'
       operation: append
+      sail.commit-id: <commit-id>
       total-data-files: '2'
       total-delete-files: '0'
       total-equality-deletes: '0'
@@ -1322,6 +1350,7 @@ data:
       deleted-data-files: '1'
       deleted-records: '2'
       operation: overwrite
+      sail.commit-id: <commit-id>
       total-data-files: '2'
       total-delete-files: '0'
       total-equality-deletes: '0'
@@ -1407,6 +1436,7 @@ data:
   deleted-data-files: '1'
   deleted-records: '2'
   operation: overwrite
+  sail.commit-id: <commit-id>
   total-data-files: '2'
   total-delete-files: '0'
   total-equality-deletes: '0'
