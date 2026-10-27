@@ -1639,6 +1639,7 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                 snapshot_properties,
                 caller_expected_snapshot_id,
                 controlled_snapshot_update_kind,
+                commit_id,
             }) => {
                 let input =
                     try_decode_physical_plan_with_converter(ctx, self, proto_converter, &input)?;
@@ -1657,7 +1658,7 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                     has_publication_controls,
                 )?;
 
-                let commit =
+                let mut commit =
                     IcebergCommitExec::new(input, table_url, lakehouse_table, snapshot_update_kind)
                         .with_expected_snapshot_id(
                             validate_read_snapshot.then_some(expected_snapshot_id),
@@ -1666,6 +1667,9 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                         .with_snapshot_properties(snapshot_properties)
                         .with_dynamic_partition_overwrite(dynamic_partition_overwrite)
                         .with_removed_data_file_paths(removed_data_file_paths);
+                if let Some(commit_id) = commit_id {
+                    commit = commit.with_commit_id(commit_id);
+                }
                 commit.validate_publication_controls()?;
                 Ok(Arc::new(commit))
             }
@@ -3041,6 +3045,7 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                     .collect(),
                 caller_expected_snapshot_id: iceberg_commit_exec.caller_expected_snapshot_id(),
                 controlled_snapshot_update_kind,
+                commit_id: Some(iceberg_commit_exec.commit_id().to_string()),
             })
         } else if let Some(manifest_scan) = node.downcast_ref::<IcebergManifestScanExec>() {
             let snapshot_json = serde_json::to_string(manifest_scan.snapshot())
@@ -6903,6 +6908,31 @@ mod tests {
                 assert_eq!(commit.removed_data_file_paths(), &["data/old.parquet"]);
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn test_round_trip_iceberg_commit_keeps_the_commit_id_of_its_statement() -> Result<()> {
+        use datafusion::physical_plan::empty::EmptyExec;
+
+        let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(Arc::new(Schema::empty())));
+        let commit = IcebergCommitExec::new(
+            input,
+            Url::parse("file:///tmp/iceberg-commit-id-codec/")
+                .map_err(|error| plan_datafusion_err!("{error}"))?,
+            None,
+            SnapshotUpdateKind::FastAppend,
+        );
+        let commit_id = commit.commit_id().to_string();
+
+        // Every attempt of the commit task decodes the plan that the driver encoded once.
+        let codec = RemoteExecutionCodec;
+        let bytes = try_encode_physical_plan(&codec, Arc::new(commit))?;
+        let decoded = try_decode_physical_plan(&TaskContext::default(), &codec, &bytes)?;
+        let decoded = decoded
+            .downcast_ref::<IcebergCommitExec>()
+            .ok_or_else(|| plan_datafusion_err!("decoded plan is not an IcebergCommitExec"))?;
+        assert_eq!(decoded.commit_id(), commit_id);
         Ok(())
     }
 

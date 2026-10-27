@@ -46,7 +46,11 @@ pub(crate) fn parse_expected_snapshot_id(key: &str, value: &str) -> DataSourceRe
     Ok(Some(snapshot_id))
 }
 
+/// The snapshot summary key that names the statement whose commit published the snapshot.
+pub(crate) const COMMIT_ID_SUMMARY_KEY: &str = "sail.commit-id";
+
 const RESERVED_SNAPSHOT_SUMMARY_KEYS: &[&str] = &[
+    COMMIT_ID_SUMMARY_KEY,
     "operation",
     "added-data-files",
     "deleted-data-files",
@@ -243,6 +247,7 @@ mod tests {
             "snapshot-property.Partitions.region",
             "snapshot-property.total-position-deletes",
             "snapshot-property.total-equality-deletes",
+            "snapshot-property.Sail.Commit-Id",
         ] {
             let error = extract_snapshot_properties(vec![direct(&[(key, "value")])])
                 .expect_err("invalid snapshot property key must fail");

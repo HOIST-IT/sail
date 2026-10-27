@@ -33,6 +33,9 @@ pub struct IcebergCommitInfo {
     pub snapshot_properties: Vec<(String, String)>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caller_expected_snapshot_id: Option<i64>,
+    /// The statement whose commit this is, the same for every attempt of the commit task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_id: Option<String>,
     pub lakehouse_table: Option<LakehouseExecutionContext>,
     pub snapshot_update_kind: SnapshotUpdateKind,
     #[serde(skip_serializing_if = "Option::is_none")]

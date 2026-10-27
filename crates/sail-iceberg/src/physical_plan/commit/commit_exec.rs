@@ -53,7 +53,7 @@ use crate::operations::metadata_commit::{
 use crate::operations::{SnapshotProducer, SnapshotUpdateKind, Transaction};
 use crate::physical_plan::action_schema::{CommitMeta, decode_actions_and_meta_from_batch};
 use crate::physical_plan::commit::IcebergCommitInfo;
-use crate::snapshot_properties::validate_snapshot_properties;
+use crate::snapshot_properties::{COMMIT_ID_SUMMARY_KEY, validate_snapshot_properties};
 use crate::spec::catalog::TableUpdate;
 use crate::spec::partition::UnboundPartitionSpec;
 use crate::spec::snapshots::MAIN_BRANCH;
@@ -238,6 +238,21 @@ fn is_pointer_update_rejection(error: &DataFusionError, compare_and_swap: bool) 
         })
 }
 
+/// The snapshot that a commit with `commit_id` published, if the table metadata has one.
+fn snapshot_published_by(table_meta: &TableMetadata, commit_id: &str) -> Option<i64> {
+    table_meta
+        .snapshots
+        .iter()
+        .find(|snapshot| {
+            snapshot
+                .summary()
+                .additional_properties
+                .get(COMMIT_ID_SUMMARY_KEY)
+                .is_some_and(|id| id == commit_id)
+        })
+        .map(|snapshot| snapshot.snapshot_id())
+}
+
 fn pointer_update_state_unknown(
     new_metadata_location: &str,
     error: &DataFusionError,
@@ -262,6 +277,9 @@ pub struct IcebergCommitExec {
     removed_data_file_paths: Vec<String>,
     dynamic_partition_overwrite: bool,
     output: CommitOutput,
+    /// Made once when the statement is planned and kept by every copy and decoding of the
+    /// plan, so every attempt of the commit task carries the same id and no other commit does.
+    commit_id: String,
     cache: Arc<PlanProperties>,
 }
 
@@ -294,8 +312,18 @@ impl IcebergCommitExec {
             removed_data_file_paths: Vec::new(),
             dynamic_partition_overwrite: false,
             output: CommitOutput::RowCount,
+            commit_id: uuid::Uuid::new_v4().to_string(),
             cache,
         }
+    }
+
+    pub fn with_commit_id(mut self, commit_id: String) -> Self {
+        self.commit_id = commit_id;
+        self
+    }
+
+    pub fn commit_id(&self) -> &str {
+        &self.commit_id
     }
 
     pub fn with_expected_snapshot_id(mut self, expected_snapshot_id: Option<Option<i64>>) -> Self {
@@ -1022,7 +1050,8 @@ impl ExecutionPlan for IcebergCommitExec {
         .with_caller_expected_snapshot_id(self.caller_expected_snapshot_id)
         .with_snapshot_properties(self.snapshot_properties.clone())
         .with_removed_data_file_paths(self.removed_data_file_paths.clone())
-        .with_dynamic_partition_overwrite(self.dynamic_partition_overwrite);
+        .with_dynamic_partition_overwrite(self.dynamic_partition_overwrite)
+        .with_commit_id(self.commit_id.clone());
         if let CommitOutput::RewriteDataFiles {
             rewritten_data_files_count,
             rewritten_bytes_count,
@@ -1065,6 +1094,7 @@ impl ExecutionPlan for IcebergCommitExec {
         let planned_removed_data_file_paths = self.removed_data_file_paths.clone();
         let dynamic_partition_overwrite = self.dynamic_partition_overwrite;
         let output = self.output.clone();
+        let commit_id = self.commit_id.clone();
         let schema = self.schema();
         let future = async move {
             let object_store = get_object_store_from_context(&context, &table_url)?;
@@ -1128,6 +1158,7 @@ impl ExecutionPlan for IcebergCommitExec {
                 table_properties: commit_meta.table_properties,
                 snapshot_properties,
                 caller_expected_snapshot_id,
+                commit_id: Some(commit_id.clone()),
                 lakehouse_table: commit_meta.lakehouse_table.or(lakehouse_table),
                 snapshot_update_kind,
                 schema: commit_meta.schema,
@@ -1344,6 +1375,20 @@ impl ExecutionPlan for IcebergCommitExec {
                 let bytes = load_metadata_file_bytes(&object_store, &latest_meta).await?;
                 let mut table_meta = TableMetadata::from_json(&bytes)
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                // A retry of the commit task runs this statement's commit again. When an earlier
+                // attempt landed, publishing again would add its rows a second time.
+                if let Some(snapshot_id) = snapshot_published_by(&table_meta, &commit_id) {
+                    log::warn!(
+                        "Iceberg commit {commit_id} was already published as snapshot \
+                         {snapshot_id} by an earlier attempt; this attempt publishes nothing"
+                    );
+                    return commit_output_batch(
+                        schema,
+                        &output,
+                        commit_info.row_count,
+                        added_data_files_count,
+                    );
+                }
                 Self::validate_requirements(Some(&table_meta), &commit_info.requirements)?;
                 if dynamic_partition_overwrite {
                     let default_spec = table_meta.default_partition_spec().ok_or_else(|| {
@@ -1673,6 +1718,7 @@ impl ExecutionPlan for IcebergCommitExec {
                     Some(manifest_meta),
                 )
                 .with_snapshot_properties(commit_info.snapshot_properties.clone())
+                .with_commit_id(commit_info.commit_id.clone())
                 .with_added_delete_files(commit_info.delete_files.clone())
                 .with_removed_data_file_paths(removed_data_file_paths.clone())
                 .with_partition_specs(table_meta.partition_specs.clone())
@@ -2206,6 +2252,8 @@ mod tests {
         LandedBesideConcurrentThenUndeletable,
         /// The store refuses the create-only put before it sends a request.
         RefusedBeforeSending,
+        /// The write never lands, and its error cannot tell whether it did.
+        LostBeforeLanding,
     }
 
     #[derive(Debug)]
@@ -2284,6 +2332,13 @@ mod tests {
                         return Err(object_store::Error::NotImplemented {
                             operation: "put_opts with PutMode::Create".to_string(),
                             implementer: "fault injection".to_string(),
+                        });
+                    }
+                    MetadataWriteFault::LostBeforeLanding => {
+                        return Err(object_store::Error::Generic {
+                            store: "fault injection",
+                            source: std::io::Error::other("connection reset during metadata write")
+                                .into(),
                         });
                     }
                     MetadataWriteFault::LandedThenUnlistable => {}
@@ -2680,18 +2735,20 @@ mod tests {
                     .await
                     .expect("publication errors must retain possibly committed task files");
 
-                let error = commit
+                // The replay finds the snapshot of the first attempt, so it reports that
+                // commit instead of failing on the snapshot the first attempt advanced.
+                let batches = commit
                     .execute(0, context.task_ctx())
                     .expect("replayed attempt")
                     .try_collect::<Vec<_>>()
                     .await
-                    .expect_err("replayed overwrite has a stale snapshot");
-                assert!(error.to_string().contains("expected snapshot None"));
+                    .expect("replayed overwrite reports the published commit");
+                assert_eq!(batches[0].num_rows(), 1);
                 store_ctx
                     .prefixed
                     .head(&task_path)
                     .await
-                    .expect("a rejected retry must retain the published task file");
+                    .expect("a replay must retain the published task file");
                 let store: Arc<dyn ObjectStore> = memory;
                 let location = crate::table::find_latest_metadata_file(&store, &table_url)
                     .await
@@ -4247,6 +4304,8 @@ mod tests {
     }
 
     struct MetadataWriteFaultRun {
+        /// The commit of `data/second.parquet` that hit the fault.
+        commit: Arc<IcebergCommitExec>,
         result: Result<Vec<RecordBatch>>,
         store: Arc<FaultInjectingMetadataStore>,
         memory: Arc<object_store::memory::InMemory>,
@@ -4401,21 +4460,19 @@ mod tests {
             )
             .await
             .expect("second data file");
-        let result = datafusion::physical_plan::collect(
-            Arc::new(commit_plan(
-                &table_url,
-                append_actions(&table_url, "data/second.parquet", 3),
-                SnapshotUpdateKind::FastAppend,
-            )),
-            context.task_ctx(),
-        )
-        .await;
+        let commit = Arc::new(commit_plan(
+            &table_url,
+            append_actions(&table_url, "data/second.parquet", 3),
+            SnapshotUpdateKind::FastAppend,
+        ));
+        let result = datafusion::physical_plan::collect(commit.clone(), context.task_ctx()).await;
         assert!(
             store.fault_injected.load(Ordering::SeqCst),
             "{site:?}: the commit never wrote {}",
             site.metadata_file()
         );
         MetadataWriteFaultRun {
+            commit,
             result,
             store,
             memory,
@@ -4539,6 +4596,159 @@ mod tests {
                 }
             }
             assert!(failures.is_empty(), "{failures:#?}");
+        });
+    }
+
+    /// Run the commit of `run` again as a region retry does: the same plan, with the output of
+    /// writers that ran again and wrote `data/third.parquet` with three rows.
+    async fn replay_with_rerun_writers(run: &mut MetadataWriteFaultRun) {
+        run.store_ctx
+            .prefixed
+            .put(
+                &Path::from("data/third.parquet"),
+                Bytes::from_static(b"third").into(),
+            )
+            .await
+            .expect("third data file");
+        let input = MemorySourceConfig::try_new_exec(
+            &[vec![append_actions(
+                &run.table_url,
+                "data/third.parquet",
+                3,
+            )]],
+            iceberg_action_schema().expect("action schema"),
+            None,
+        )
+        .expect("rerun writer output");
+        let replay = Arc::clone(&run.commit)
+            .replace_children(
+                vec![input],
+                datafusion::physical_plan::ReplaceChildrenOptions::new(
+                    datafusion::physical_plan::ChildrenPropertiesMode::Recompute,
+                ),
+            )
+            .expect("replayed commit");
+        let context = SessionContext::new();
+        let store: Arc<dyn ObjectStore> = run.memory.clone();
+        context
+            .runtime_env()
+            .register_object_store(&Url::parse("file:///").expect("file store URL"), store);
+        run.result = datafusion::physical_plan::collect(replay, context.task_ctx()).await;
+    }
+
+    #[test]
+    fn replayed_commit_publishes_nothing_after_an_earlier_attempt_landed() {
+        futures::executor::block_on(async {
+            let mut failures = Vec::new();
+            for site in MetadataWriteSite::ALL {
+                // The first attempt commits, or its write lands and reports an unknown state.
+                for fault in [
+                    MetadataWriteFault::LandedThenExists,
+                    MetadataWriteFault::LostAcknowledgement,
+                ] {
+                    let case = format!("{site:?}, {fault:?}");
+                    let mut run = run_commit_with_metadata_write_fault(site, fault).await;
+                    replay_with_rerun_writers(&mut run).await;
+                    failures.extend(
+                        landed_write_failures(site, &run)
+                            .await
+                            .into_iter()
+                            .map(|failure| format!("{case}, replay: {failure}")),
+                    );
+                }
+            }
+            assert!(failures.is_empty(), "{failures:#?}");
+        });
+    }
+
+    #[test]
+    fn replayed_commit_after_a_write_that_never_landed_commits_once() {
+        futures::executor::block_on(async {
+            let mut failures = Vec::new();
+            for site in MetadataWriteSite::ALL {
+                let mut run = run_commit_with_metadata_write_fault(
+                    site,
+                    MetadataWriteFault::LostBeforeLanding,
+                )
+                .await;
+                match &run.result {
+                    Err(error) if is_commit_state_unknown(error) => {}
+                    other => failures.push(format!("{site:?}: first attempt {other:?}")),
+                }
+                replay_with_rerun_writers(&mut run).await;
+                let batches = match &run.result {
+                    Ok(batches) => batches,
+                    Err(error) => {
+                        failures.push(format!("{site:?}: replay failed: {error}"));
+                        continue;
+                    }
+                };
+                if committed_count(batches) != Some(3) {
+                    failures.push(format!("{site:?}: count {:?}", committed_count(batches)));
+                }
+                let (location, files) = run.committed_table().await;
+                if !location.ends_with(site.metadata_file()) {
+                    failures.push(format!("{site:?}: latest metadata {location}"));
+                }
+                let mut expected = vec![("data/third.parquet".to_string(), 3)];
+                if matches!(site, MetadataWriteSite::NextVersion) {
+                    expected.insert(0, ("data/first.parquet".to_string(), 2));
+                }
+                if files != expected {
+                    failures.push(format!("{site:?}: live files {files:?}"));
+                }
+            }
+            assert!(failures.is_empty(), "{failures:#?}");
+        });
+    }
+
+    #[test]
+    fn new_statement_appends_again_after_a_landed_commit() {
+        futures::executor::block_on(async {
+            let run = run_commit_with_metadata_write_fault(
+                MetadataWriteSite::NextVersion,
+                MetadataWriteFault::LandedThenExists,
+            )
+            .await;
+            run.result.as_ref().expect("first statement commits");
+            let context = SessionContext::new();
+            let store: Arc<dyn ObjectStore> = run.memory.clone();
+            context
+                .runtime_env()
+                .register_object_store(&Url::parse("file:///").expect("file store URL"), store);
+            run.store_ctx
+                .prefixed
+                .put(
+                    &Path::from("data/third.parquet"),
+                    Bytes::from_static(b"third").into(),
+                )
+                .await
+                .expect("third data file");
+            // Running the same append again plans a new statement, which is not a replay.
+            let batches = datafusion::physical_plan::collect(
+                Arc::new(commit_plan(
+                    &run.table_url,
+                    append_actions(&run.table_url, "data/third.parquet", 3),
+                    SnapshotUpdateKind::FastAppend,
+                )),
+                context.task_ctx(),
+            )
+            .await
+            .expect("second statement commits");
+            assert_eq!(committed_count(&batches), Some(3));
+            let (location, files) = run.committed_table().await;
+            assert!(
+                location.ends_with("metadata/v4.metadata.json"),
+                "{location}"
+            );
+            assert_eq!(
+                files,
+                vec![
+                    ("data/first.parquet".to_string(), 2),
+                    ("data/second.parquet".to_string(), 3),
+                    ("data/third.parquet".to_string(), 3),
+                ]
+            );
         });
     }
 }

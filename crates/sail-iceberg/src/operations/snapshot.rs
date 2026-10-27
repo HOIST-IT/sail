@@ -20,7 +20,9 @@ use serde::{Deserialize, Serialize};
 
 use super::{ActionCommit, Transaction};
 use crate::io::StoreContext;
-use crate::snapshot_properties::{insert_snapshot_properties, validate_snapshot_properties};
+use crate::snapshot_properties::{
+    COMMIT_ID_SUMMARY_KEY, insert_snapshot_properties, validate_snapshot_properties,
+};
 use crate::spec::manifest::{ManifestEntry, ManifestWriter, ManifestWriterBuilder};
 use crate::spec::manifest_list::ManifestListWriter;
 use crate::spec::{
@@ -387,6 +389,8 @@ pub struct SnapshotProducer<'a> {
     pub added_data_files: Vec<DataFile>,
     pub added_delete_files: Vec<DataFile>,
     pub snapshot_properties: Vec<(String, String)>,
+    /// The statement whose commit publishes the snapshot, recorded in its summary.
+    pub commit_id: Option<String>,
     pub removed_data_file_paths: Vec<String>,
     pub store_ctx: Option<StoreContext>,
     pub manifest_metadata: Option<crate::spec::manifest::ManifestMetadata>,
@@ -521,6 +525,7 @@ impl<'a> SnapshotProducer<'a> {
             added_data_files,
             added_delete_files: Vec::new(),
             snapshot_properties: Vec::new(),
+            commit_id: None,
             removed_data_file_paths: Vec::new(),
             store_ctx,
             manifest_metadata,
@@ -556,6 +561,11 @@ impl<'a> SnapshotProducer<'a> {
 
     pub fn with_snapshot_properties(mut self, properties: Vec<(String, String)>) -> Self {
         self.snapshot_properties = properties;
+        self
+    }
+
+    pub fn with_commit_id(mut self, commit_id: Option<String>) -> Self {
+        self.commit_id = commit_id;
         self
     }
 
@@ -1268,6 +1278,9 @@ impl<'a> SnapshotProducer<'a> {
                     "Iceberg removed position deletes exceed the snapshot total".to_string()
                 })?;
             summary = summary.with_property("total-position-deletes", remaining.to_string());
+        }
+        if let Some(commit_id) = &self.commit_id {
+            summary = summary.with_property(COMMIT_ID_SUMMARY_KEY, commit_id);
         }
         insert_snapshot_properties(&mut summary, &self.snapshot_properties)
             .map_err(|error| error.to_string())?;

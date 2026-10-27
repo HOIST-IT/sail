@@ -1094,6 +1094,9 @@ message IcebergCommitExecNode {
   optional int64 caller_expected_snapshot_id = 10;
   // Carries the real update kind when field 6 is the fail-closed controlled-write sentinel.
   optional IcebergSnapshotUpdateKind controlled_snapshot_update_kind = 11;
+  // Identifies the statement, so that every attempt of the commit task finds what an earlier
+  // attempt published.
+  optional string commit_id = 12;
 }
 
 message IcebergManifestScanExecNode {

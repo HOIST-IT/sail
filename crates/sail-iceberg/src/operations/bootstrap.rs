@@ -317,6 +317,7 @@ pub(crate) async fn prepare_bootstrap_snapshot(
     )
     .with_bootstrap(true)
     .with_snapshot_properties(commit_info.snapshot_properties.clone())
+    .with_commit_id(commit_info.commit_id.clone())
     .with_added_delete_files(commit_info.delete_files.clone())
     .with_partition_specs(table_metadata.partition_specs.clone())
     .with_row_lineage_start_row_id(row_lineage_start_row_id)
@@ -402,6 +403,7 @@ pub async fn bootstrap_new_table_with_style(
     )
     .with_bootstrap(true)
     .with_snapshot_properties(commit_info.snapshot_properties.clone())
+    .with_commit_id(commit_info.commit_id.clone())
     .with_added_delete_files(commit_info.delete_files.clone())
     .with_partition_specs(vec![partition_spec.clone()])
     .with_row_lineage_start_row_id(row_lineage_start_row_id)
@@ -894,6 +896,7 @@ mod tests {
                 table_properties: vec![("format-version".to_string(), "2".to_string())],
                 snapshot_properties: vec![],
                 caller_expected_snapshot_id: None,
+                commit_id: None,
                 lakehouse_table: None,
                 snapshot_update_kind: crate::operations::SnapshotUpdateKind::FastAppend,
                 schema: Some(schema),
@@ -958,6 +961,7 @@ mod tests {
                 ],
                 snapshot_properties: vec![],
                 caller_expected_snapshot_id: None,
+                commit_id: None,
                 lakehouse_table: None,
                 snapshot_update_kind: crate::operations::SnapshotUpdateKind::FastAppend,
                 schema: Some(schema),
@@ -1021,6 +1025,7 @@ mod tests {
                 ),
             ],
             caller_expected_snapshot_id: None,
+            commit_id: None,
             lakehouse_table: None,
             snapshot_update_kind: crate::operations::SnapshotUpdateKind::FastAppend,
             schema: Some(publication_schema()),
