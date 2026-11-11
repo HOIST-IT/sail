@@ -107,6 +107,23 @@
         - expected-snapshot-id
       parser: crate::snapshot_properties::parse_expected_snapshot_id
 
+- key: publish_empty_snapshot
+  description: |
+    If `true`, a write with snapshot properties or an expected snapshot id that changes no data
+    publishes an empty `append` snapshot that carries them. Otherwise such a write fails.
+  default:
+    value: "false"
+    parser: crate::options::parsers::parse_bool
+  supported: true
+  rust_type: bool
+  scopes:
+    - write
+  origins:
+    - type: option
+      keys:
+        - publish-empty-snapshot
+      parser: crate::options::parsers::parse_bool
+
 - key: overwrite_mode
   description: Select overwrite mode.
   default:

@@ -144,3 +144,81 @@ def test_iceberg_write_option_overrides_the_session_snapshot_property(spark, tmp
         assert properties["hoist.job"] == "session-job"
     finally:
         spark.sql(f"DROP TABLE IF EXISTS {table_name}")
+
+
+PUBLISH_EMPTY_SNAPSHOT = "spark.sail.iceberg.publish-empty-snapshot"
+NO_OP_COMMANDS = {
+    "merge": """
+        MERGE INTO {table} t USING (SELECT 99L AS id, 'Z' AS category, 0L AS value) s
+        ON t.id = s.id
+        WHEN MATCHED THEN UPDATE SET value = s.value
+        """,
+    "delete": "DELETE FROM {table} WHERE category = 'Z'",
+}
+
+
+@pytest.mark.parametrize("opted_in", [False, True], ids=["refused", "opted-in"])
+@pytest.mark.parametrize("controls", ["properties", "fence-only"])
+@pytest.mark.parametrize("command", list(NO_OP_COMMANDS))
+@pytest.mark.parametrize("mode", list(TABLE_MODES))
+def test_iceberg_row_level_command_that_changes_nothing_publishes_its_controls_only_when_opted_in(
+    spark, tmp_path, mode, command, controls, opted_in
+):
+    table_name = "iceberg_row_level_empty_snapshot"
+    location = tmp_path / table_name
+    _create_table(spark, table_name, location, mode)
+    try:
+        planned = _current_snapshot(location)
+        rows_before = _rows(spark, table_name)
+        metadata_before = set((location / "metadata").glob("*.metadata.json"))
+        statement = NO_OP_COMMANDS[command].format(table=table_name)
+
+        settings = {EXPECTED_SNAPSHOT: str(planned.snapshot_id)}
+        if controls == "properties":
+            settings[RUN_ID] = "run-3"
+        if opted_in:
+            settings[PUBLISH_EMPTY_SNAPSHOT] = "true"
+            with _session_conf(spark, settings):
+                spark.sql(statement)
+            committed = _current_snapshot(location)
+            assert committed.parent_snapshot_id == planned.snapshot_id
+            assert committed.summary.operation.value == "append"
+            assert committed.summary.additional_properties.get("hoist.run-id") == settings.get(RUN_ID)
+            assert "added-data-files" not in committed.summary.additional_properties
+            assert "deleted-data-files" not in committed.summary.additional_properties
+        else:
+            with _session_conf(spark, settings), pytest.raises(Exception, match="changes no data"):
+                spark.sql(statement)
+            assert _current_snapshot(location).snapshot_id == planned.snapshot_id
+            assert set((location / "metadata").glob("*.metadata.json")) == metadata_before
+        assert _rows(spark, table_name) == rows_before
+    finally:
+        spark.sql(f"DROP TABLE IF EXISTS {table_name}")
+
+
+@pytest.mark.parametrize("opted_in", [False, True], ids=["refused", "opted-in"])
+def test_iceberg_write_that_changes_nothing_publishes_its_controls_only_when_opted_in(spark, tmp_path, opted_in):
+    table_name = "iceberg_write_empty_snapshot"
+    location = tmp_path / table_name
+    _create_table(spark, table_name, location, "copy-on-write")
+    try:
+        planned = _current_snapshot(location)
+        writer = (
+            spark.createDataFrame([], schema="id BIGINT, category STRING, value BIGINT")
+            .writeTo(table_name)
+            .option("snapshot-property.hoist.run-id", "run-4")
+            .option("expected-snapshot-id", str(planned.snapshot_id))
+        )
+        if opted_in:
+            writer.option("publish-empty-snapshot", "true").overwritePartitions()
+            committed = _current_snapshot(location)
+            assert committed.parent_snapshot_id == planned.snapshot_id
+            assert committed.summary.operation.value == "append"
+            assert committed.summary.additional_properties["hoist.run-id"] == "run-4"
+            assert "replace-partitions" not in committed.summary.additional_properties
+        else:
+            with pytest.raises(Exception, match="changes no data"):
+                writer.overwritePartitions()
+            assert _current_snapshot(location).snapshot_id == planned.snapshot_id
+    finally:
+        spark.sql(f"DROP TABLE IF EXISTS {table_name}")

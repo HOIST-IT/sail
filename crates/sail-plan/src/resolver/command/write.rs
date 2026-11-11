@@ -1771,6 +1771,7 @@ impl PlanResolver<'_> {
     /// Iceberg options that control one commit and must not persist as table properties.
     fn is_iceberg_commit_only_option(key: &str) -> bool {
         key.eq_ignore_ascii_case("expected-snapshot-id")
+            || key.eq_ignore_ascii_case("publish-empty-snapshot")
             || key
                 .get(.."snapshot-property.".len())
                 .is_some_and(|prefix| prefix.eq_ignore_ascii_case("snapshot-property."))
@@ -2134,6 +2135,7 @@ mod tests {
         for key in [
             "expected-snapshot-id",
             "EXPECTED-SNAPSHOT-ID",
+            "publish-empty-snapshot",
             "snapshot-property.hoist.id",
             "Snapshot-Property.x",
         ] {

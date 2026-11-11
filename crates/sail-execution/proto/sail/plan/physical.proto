@@ -1097,6 +1097,8 @@ message IcebergCommitExecNode {
   // Identifies the statement, so that every attempt of the commit task finds what an earlier
   // attempt published.
   optional string commit_id = 12;
+  // Whether a controlled commit that changes no data publishes an empty snapshot.
+  bool publish_empty_snapshot = 13;
 }
 
 message IcebergManifestScanExecNode {

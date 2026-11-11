@@ -235,8 +235,9 @@ pub(crate) fn get_pyspark_version() -> SparkResult<String> {
 /// Spark runtime (`SparkSQLProperties.SNAPSHOT_PROPERTY_PREFIX`).
 const ICEBERG_SNAPSHOT_PROPERTY_PREFIX: &str = "spark.sql.iceberg.snapshot-property.";
 
-/// The session configuration key of the snapshot an Iceberg row-level command must commit on.
-const ICEBERG_ROW_LEVEL_EXPECTED_SNAPSHOT_ID: &str = "spark.sail.iceberg.expected-snapshot-id";
+/// The Iceberg write options that a row-level command, which takes no write options, reads from
+/// `spark.sail.iceberg.<option>` in the session configuration.
+const ICEBERG_ROW_LEVEL_OPTIONS: [&str; 2] = ["expected-snapshot-id", "publish-empty-snapshot"];
 
 impl TryFrom<&SparkRuntimeConfig> for PlanConfig {
     type Error = SparkError;
@@ -421,10 +422,13 @@ impl TryFrom<&SparkRuntimeConfig> for PlanConfig {
         iceberg_snapshot_properties.sort();
         output.iceberg_snapshot_properties = iceberg_snapshot_properties;
         // An empty value counts as unset, as `spark.conf.set(key, "")` is a common way to clear it.
-        output.iceberg_row_level_expected_snapshot_id = config
-            .get_option(ICEBERG_ROW_LEVEL_EXPECTED_SNAPSHOT_ID)
-            .filter(|value| !value.trim().is_empty())
-            .map(str::to_string);
+        output.iceberg_row_level_options = ICEBERG_ROW_LEVEL_OPTIONS
+            .into_iter()
+            .filter_map(|option| {
+                let value = config.get_option(&format!("spark.sail.iceberg.{option}"))?;
+                (!value.trim().is_empty()).then(|| (option.to_string(), value.to_string()))
+            })
+            .collect();
 
         output.pyspark_udf_config = Arc::new(PySparkUdfConfig::try_from(config)?);
 

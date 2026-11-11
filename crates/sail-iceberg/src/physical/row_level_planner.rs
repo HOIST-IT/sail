@@ -262,6 +262,7 @@ fn ensure_current_row_level_mode(table: &Table, node: &RowLevelWriteNode) -> Res
 struct RowLevelCommitControls {
     snapshot_properties: Vec<(String, String)>,
     caller_expected_snapshot_id: Option<i64>,
+    publish_empty_snapshot: bool,
 }
 
 impl RowLevelCommitControls {
@@ -269,6 +270,7 @@ impl RowLevelCommitControls {
         commit
             .with_caller_expected_snapshot_id(self.caller_expected_snapshot_id)
             .with_snapshot_properties(self.snapshot_properties)
+            .with_publish_empty_snapshot(self.publish_empty_snapshot)
     }
 }
 
@@ -310,6 +312,7 @@ fn resolve_row_level_writer_options(
         IcebergWriterExecOptions::variant_shredding_option_presence(&clean_options);
     let iceberg_options = IcebergWriteOptions::resolve(session, clean_options)?;
     let caller_expected_snapshot_id = iceberg_options.caller_expected_snapshot_id;
+    let publish_empty_snapshot = iceberg_options.publish_empty_snapshot;
     check_caller_expected_snapshot(caller_expected_snapshot_id, node.expected_snapshot_id())?;
     let mut writer_options = IcebergWriterExecOptions::from(iceberg_options);
     writer_options.apply_variant_shredding_option_presence(variant_presence);
@@ -320,6 +323,7 @@ fn resolve_row_level_writer_options(
     let controls = RowLevelCommitControls {
         snapshot_properties,
         caller_expected_snapshot_id,
+        publish_empty_snapshot,
     };
     Ok((writer_options, controls))
 }

@@ -654,6 +654,7 @@ pub(crate) async fn plan_iceberg_write(
         IcebergWriterExecOptions::variant_shredding_option_presence(&clean_options);
     let iceberg_options = IcebergWriteOptions::resolve(ctx, clean_options)?;
     let caller_expected_snapshot_id = iceberg_options.caller_expected_snapshot_id;
+    let publish_empty_snapshot = iceberg_options.publish_empty_snapshot;
     if caller_expected_snapshot_id.is_some()
         && matches!(
             &mode,
@@ -839,7 +840,8 @@ pub(crate) async fn plan_iceberg_write(
         ctx,
     )
     .with_caller_expected_snapshot_id(caller_expected_snapshot_id)
-    .with_snapshot_properties(snapshot_properties);
+    .with_snapshot_properties(snapshot_properties)
+    .with_publish_empty_snapshot(publish_empty_snapshot);
     if preserve_input_partitions {
         builder = builder.preserve_input_partitions();
     }

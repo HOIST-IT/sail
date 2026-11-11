@@ -274,6 +274,7 @@ pub struct IcebergCommitExec {
     expected_snapshot_id: Option<Option<i64>>,
     caller_expected_snapshot_id: Option<i64>,
     snapshot_properties: Vec<(String, String)>,
+    publish_empty_snapshot: bool,
     removed_data_file_paths: Vec<String>,
     dynamic_partition_overwrite: bool,
     output: CommitOutput,
@@ -311,6 +312,7 @@ impl IcebergCommitExec {
             expected_snapshot_id: None,
             caller_expected_snapshot_id: None,
             snapshot_properties: Vec::new(),
+            publish_empty_snapshot: false,
             removed_data_file_paths: Vec::new(),
             dynamic_partition_overwrite: false,
             output: CommitOutput::RowCount,
@@ -342,6 +344,13 @@ impl IcebergCommitExec {
     /// Add caller properties to the summary of the snapshot this write commits.
     pub fn with_snapshot_properties(mut self, properties: Vec<(String, String)>) -> Self {
         self.snapshot_properties = properties;
+        self
+    }
+
+    /// Publish an empty snapshot for a write with publication controls that changes no data,
+    /// so that its snapshot properties are recorded, instead of failing the write.
+    pub fn with_publish_empty_snapshot(mut self, enabled: bool) -> Self {
+        self.publish_empty_snapshot = enabled;
         self
     }
 
@@ -408,6 +417,10 @@ impl IcebergCommitExec {
 
     pub fn snapshot_properties(&self) -> &[(String, String)] {
         &self.snapshot_properties
+    }
+
+    pub fn publish_empty_snapshot(&self) -> bool {
+        self.publish_empty_snapshot
     }
 
     /// Reject publication controls that could never commit as requested.
@@ -1051,6 +1064,7 @@ impl ExecutionPlan for IcebergCommitExec {
         .with_expected_snapshot_id(self.expected_snapshot_id)
         .with_caller_expected_snapshot_id(self.caller_expected_snapshot_id)
         .with_snapshot_properties(self.snapshot_properties.clone())
+        .with_publish_empty_snapshot(self.publish_empty_snapshot)
         .with_removed_data_file_paths(self.removed_data_file_paths.clone())
         .with_dynamic_partition_overwrite(self.dynamic_partition_overwrite)
         .with_commit_id(self.commit_id.clone());
@@ -1093,6 +1107,7 @@ impl ExecutionPlan for IcebergCommitExec {
         let expected_snapshot_id = self.expected_snapshot_id;
         let caller_expected_snapshot_id = self.caller_expected_snapshot_id;
         let snapshot_properties = self.snapshot_properties.clone();
+        let publish_empty_snapshot = self.publish_empty_snapshot;
         let planned_removed_data_file_paths = self.removed_data_file_paths.clone();
         let dynamic_partition_overwrite = self.dynamic_partition_overwrite;
         let output = self.output.clone();
@@ -1415,8 +1430,12 @@ impl ExecutionPlan for IcebergCommitExec {
                         current_schema,
                     )?;
                 }
+                // A merge-on-read writer of a format-version 2 table does not skip an empty
+                // commit, but a controlled one must still fail or publish an empty append.
                 if (skip_empty_commit
-                    || empty_rewrite_is_noop(snapshot_update_kind, dynamic_partition_overwrite))
+                    || empty_rewrite_is_noop(snapshot_update_kind, dynamic_partition_overwrite)
+                    || (has_publication_controls
+                        && snapshot_update_kind == SnapshotUpdateKind::RowDelta))
                     && commit_info.data_files.is_empty()
                     && commit_info.delete_files.is_empty()
                     && removed_data_file_paths.is_empty()
@@ -1424,14 +1443,19 @@ impl ExecutionPlan for IcebergCommitExec {
                     // Skipping publishes no snapshot, so the snapshot properties would be
                     // dropped and the caller could not tell this write from one that never ran.
                     // A controlled write must publish what its controls describe.
-                    if has_publication_controls {
+                    if !has_publication_controls {
+                        return commit_output_batch(schema, &output, commit_info.row_count, 0);
+                    }
+                    if !publish_empty_snapshot {
                         return plan_err!(
                             "Iceberg write with publication controls changes no data and would \
                              publish no snapshot, so its snapshot properties and expected \
                              snapshot ID cannot be honored"
                         );
                     }
-                    return commit_output_batch(schema, &output, commit_info.row_count, 0);
+                    // The snapshot changes no data, so it is an append of nothing, which no
+                    // reader can take for a removal.
+                    commit_info.snapshot_update_kind = SnapshotUpdateKind::FastAppend;
                 }
                 let original_format_version = table_meta.format_version;
                 let mut metadata_updates = Vec::new();
@@ -1728,7 +1752,11 @@ impl ExecutionPlan for IcebergCommitExec {
                 .with_removed_data_file_paths(removed_data_file_paths.clone())
                 .with_partition_specs(table_meta.partition_specs.clone())
                 .with_row_lineage_start_row_id(row_lineage_start_row_id)
-                .mark_dynamic_partition_overwrite(dynamic_partition_overwrite)
+                // An empty append replaces no partitions.
+                .mark_dynamic_partition_overwrite(
+                    dynamic_partition_overwrite
+                        && commit_info.snapshot_update_kind != SnapshotUpdateKind::FastAppend,
+                )
                 .prepare(commit_info.snapshot_update_kind)
                 .await
                 .map_err(DataFusionError::Execution)?;
@@ -4352,6 +4380,73 @@ mod tests {
                     "an empty overwrite must not publish a snapshot"
                 );
             }
+
+            // Opted in, the controlled write publishes an empty append that carries its controls.
+            let plan: Arc<dyn ExecutionPlan> = Arc::new(
+                commit_plan(
+                    &table_url,
+                    empty_overwrite.clone(),
+                    SnapshotUpdateKind::CopyOnWrite,
+                )
+                .with_expected_snapshot_id(Some(Some(snapshot_id)))
+                .with_dynamic_partition_overwrite(true)
+                .with_caller_expected_snapshot_id(Some(snapshot_id))
+                .with_snapshot_properties(vec![(
+                    "hoist.publication-id".to_string(),
+                    "publication-2".to_string(),
+                )])
+                .with_publish_empty_snapshot(true),
+            );
+            // Rebuilt the way an optimizer rule rebuilds it, the commit keeps the setting.
+            let children = plan.children().into_iter().cloned().collect();
+            let plan = Arc::clone(&plan)
+                .replace_children(
+                    children,
+                    datafusion::physical_plan::ReplaceChildrenOptions::new(
+                        datafusion::physical_plan::ChildrenPropertiesMode::Recompute,
+                    ),
+                )
+                .expect("rebuilt commit");
+            let batches = datafusion::physical_plan::collect(plan, context.task_ctx())
+                .await
+                .expect("an opted-in controlled write that changes nothing publishes");
+            assert_eq!(committed_count(&batches), Some(0));
+            let published = crate::table::find_latest_metadata_file(&store, &table_url)
+                .await
+                .expect("metadata location");
+            assert_ne!(published, head);
+            let metadata = TableMetadata::from_json(
+                &load_metadata_file_bytes(&store, &published)
+                    .await
+                    .expect("metadata bytes"),
+            )
+            .expect("metadata");
+            let snapshot = metadata.current_snapshot().expect("published snapshot");
+            assert_eq!(snapshot.parent_snapshot_id(), Some(snapshot_id));
+            let summary = snapshot.summary();
+            assert_eq!(summary.operation, Operation::Append);
+            assert_eq!(
+                summary
+                    .additional_properties
+                    .get("hoist.publication-id")
+                    .map(String::as_str),
+                Some("publication-2")
+            );
+            assert!(
+                !summary
+                    .additional_properties
+                    .contains_key("added-data-files")
+            );
+            assert!(
+                !summary
+                    .additional_properties
+                    .contains_key("deleted-data-files")
+            );
+            assert!(
+                !summary
+                    .additional_properties
+                    .contains_key("replace-partitions")
+            );
         });
     }
 

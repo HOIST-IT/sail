@@ -43,6 +43,7 @@ pub struct IcebergPlanBuilder<'a> {
     expected_snapshot_id: Option<Option<i64>>,
     caller_expected_snapshot_id: Option<i64>,
     snapshot_properties: Vec<(String, String)>,
+    publish_empty_snapshot: bool,
     removed_data_file_paths: Vec<String>,
     dynamic_partition_overwrite: bool,
     preserve_input_partitions: bool,
@@ -66,6 +67,7 @@ impl<'a> IcebergPlanBuilder<'a> {
             expected_snapshot_id: None,
             caller_expected_snapshot_id: None,
             snapshot_properties: Vec::new(),
+            publish_empty_snapshot: false,
             removed_data_file_paths: Vec::new(),
             dynamic_partition_overwrite: false,
             preserve_input_partitions: false,
@@ -85,6 +87,11 @@ impl<'a> IcebergPlanBuilder<'a> {
 
     pub fn with_snapshot_properties(mut self, properties: Vec<(String, String)>) -> Self {
         self.snapshot_properties = properties;
+        self
+    }
+
+    pub fn with_publish_empty_snapshot(mut self, enabled: bool) -> Self {
+        self.publish_empty_snapshot = enabled;
         self
     }
 
@@ -253,6 +260,7 @@ impl<'a> IcebergPlanBuilder<'a> {
             .with_expected_snapshot_id(self.expected_snapshot_id)
             .with_caller_expected_snapshot_id(self.caller_expected_snapshot_id)
             .with_snapshot_properties(self.snapshot_properties.clone())
+            .with_publish_empty_snapshot(self.publish_empty_snapshot)
             .with_removed_data_file_paths(self.removed_data_file_paths.clone())
             .with_dynamic_partition_overwrite(self.dynamic_partition_overwrite),
         ))

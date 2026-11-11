@@ -155,9 +155,7 @@ impl PlanResolver<'_> {
                 .iter()
                 .map(|(key, value)| (format!("snapshot-property.{key}"), value.clone()))
                 .collect::<Vec<_>>();
-            if let Some(snapshot_id) = &self.config.iceberg_row_level_expected_snapshot_id {
-                items.push(("expected-snapshot-id".to_string(), snapshot_id.clone()));
-            }
+            items.extend(self.config.iceberg_row_level_options.iter().cloned());
             if !items.is_empty() {
                 options.push(OptionLayer::OptionList { items });
             }

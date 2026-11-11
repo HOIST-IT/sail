@@ -1640,6 +1640,7 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                 caller_expected_snapshot_id,
                 controlled_snapshot_update_kind,
                 commit_id,
+                publish_empty_snapshot,
             }) => {
                 let input =
                     try_decode_physical_plan_with_converter(ctx, self, proto_converter, &input)?;
@@ -1665,6 +1666,7 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                         )
                         .with_caller_expected_snapshot_id(caller_expected_snapshot_id)
                         .with_snapshot_properties(snapshot_properties)
+                        .with_publish_empty_snapshot(publish_empty_snapshot)
                         .with_dynamic_partition_overwrite(dynamic_partition_overwrite)
                         .with_removed_data_file_paths(removed_data_file_paths);
                 if let Some(commit_id) = commit_id {
@@ -3046,6 +3048,7 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                 caller_expected_snapshot_id: iceberg_commit_exec.caller_expected_snapshot_id(),
                 controlled_snapshot_update_kind,
                 commit_id: Some(iceberg_commit_exec.commit_id().to_string()),
+                publish_empty_snapshot: iceberg_commit_exec.publish_empty_snapshot(),
             })
         } else if let Some(manifest_scan) = node.downcast_ref::<IcebergManifestScanExec>() {
             let snapshot_json = serde_json::to_string(manifest_scan.snapshot())
@@ -7002,7 +7005,8 @@ mod tests {
                 snapshot_update_kind,
             )
             .with_caller_expected_snapshot_id(Some(42))
-            .with_snapshot_properties(snapshot_properties.clone()),
+            .with_snapshot_properties(snapshot_properties.clone())
+            .with_publish_empty_snapshot(true),
         );
 
         let codec = RemoteExecutionCodec;
@@ -7055,6 +7059,7 @@ mod tests {
         assert_eq!(commit.snapshot_update_kind(), snapshot_update_kind);
         assert_eq!(commit.caller_expected_snapshot_id(), Some(42));
         assert_eq!(commit.snapshot_properties(), snapshot_properties);
+        assert!(commit.publish_empty_snapshot());
         Ok(())
     }
 
