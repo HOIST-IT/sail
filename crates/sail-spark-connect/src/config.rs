@@ -231,6 +231,13 @@ pub(crate) fn get_pyspark_version() -> SparkResult<String> {
 // We must use `get_option` when extracting values from `SparkRuntimeConfig`
 // since not all configuration keys are supported in all versions of Spark.
 
+/// The session configuration prefix of Iceberg snapshot summary properties, as in Iceberg's
+/// Spark runtime (`SparkSQLProperties.SNAPSHOT_PROPERTY_PREFIX`).
+const ICEBERG_SNAPSHOT_PROPERTY_PREFIX: &str = "spark.sql.iceberg.snapshot-property.";
+
+/// The session configuration key of the snapshot an Iceberg row-level command must commit on.
+const ICEBERG_ROW_LEVEL_EXPECTED_SNAPSHOT_ID: &str = "spark.sail.iceberg.expected-snapshot-id";
+
 impl TryFrom<&SparkRuntimeConfig> for PlanConfig {
     type Error = SparkError;
 
@@ -400,6 +407,24 @@ impl TryFrom<&SparkRuntimeConfig> for PlanConfig {
         {
             output.legacy_size_of_null = value;
         }
+
+        let mut iceberg_snapshot_properties = config
+            .get_all(Some(ICEBERG_SNAPSHOT_PROPERTY_PREFIX))?
+            .into_iter()
+            .filter_map(|ConfigKeyValue { key, value }| {
+                let key = key
+                    .strip_prefix(ICEBERG_SNAPSHOT_PROPERTY_PREFIX)?
+                    .to_string();
+                Some((key, value?))
+            })
+            .collect::<Vec<_>>();
+        iceberg_snapshot_properties.sort();
+        output.iceberg_snapshot_properties = iceberg_snapshot_properties;
+        // An empty value counts as unset, as `spark.conf.set(key, "")` is a common way to clear it.
+        output.iceberg_row_level_expected_snapshot_id = config
+            .get_option(ICEBERG_ROW_LEVEL_EXPECTED_SNAPSHOT_ID)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string);
 
         output.pyspark_udf_config = Arc::new(PySparkUdfConfig::try_from(config)?);
 

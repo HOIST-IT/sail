@@ -84,14 +84,13 @@ impl PlanResolver<'_> {
                         },
                     )
                     .await?;
+                let options = self.row_level_target_options(&format, metadata.properties);
                 return Ok(RowLevelTarget {
                     table_name: table.clone().into(),
                     format,
                     location,
                     partition_by: vec![],
-                    options: vec![OptionLayer::TablePropertyList {
-                        items: metadata.properties,
-                    }],
+                    options,
                     lakehouse_table: None,
                 });
             }
@@ -123,12 +122,13 @@ impl PlanResolver<'_> {
                         vec![],
                     )
                     .await?;
+                let options = self.row_level_target_options(&normalized_format, properties);
                 Ok(RowLevelTarget {
                     table_name,
                     format: normalized_format,
                     location,
                     partition_by: partition_by.into_iter().map(|field| field.column).collect(),
-                    options: vec![OptionLayer::TablePropertyList { items: properties }],
+                    options,
                     lakehouse_table: Some(lakehouse_table),
                 })
             }
@@ -136,5 +136,32 @@ impl PlanResolver<'_> {
                 "row-level operations are only supported against tables",
             )),
         }
+    }
+
+    /// The target's table properties, followed for an Iceberg target by the session's
+    /// commit controls, which the plan keeps for the commit of this command.
+    fn row_level_target_options(
+        &self,
+        format: &str,
+        table_properties: Vec<(String, String)>,
+    ) -> Vec<OptionLayer> {
+        let mut options = vec![OptionLayer::TablePropertyList {
+            items: table_properties,
+        }];
+        if format.eq_ignore_ascii_case("iceberg") {
+            let mut items = self
+                .config
+                .iceberg_snapshot_properties
+                .iter()
+                .map(|(key, value)| (format!("snapshot-property.{key}"), value.clone()))
+                .collect::<Vec<_>>();
+            if let Some(snapshot_id) = &self.config.iceberg_row_level_expected_snapshot_id {
+                items.push(("expected-snapshot-id".to_string(), snapshot_id.clone()));
+            }
+            if !items.is_empty() {
+                options.push(OptionLayer::OptionList { items });
+            }
+        }
+        options
     }
 }

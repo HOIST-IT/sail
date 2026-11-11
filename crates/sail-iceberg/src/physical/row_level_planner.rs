@@ -20,6 +20,7 @@ use crate::physical_plan::merge_row_projection::IcebergMergeRowProjection;
 use crate::physical_plan::{
     IcebergCommitExec, IcebergWriterExec, IcebergWriterExecOptions, prepare_iceberg_write_context,
 };
+use crate::snapshot_properties::extract_snapshot_properties;
 use crate::table::Table;
 
 pub(crate) async fn plan_iceberg_row_level_write(
@@ -68,7 +69,7 @@ async fn plan_iceberg_merge_on_read(
         return Ok(plan);
     }
     let partition_columns = IcebergLakeSource::partition_columns_from_metadata(&table)?;
-    let writer_options = resolve_row_level_writer_options(session, node)?;
+    let (writer_options, controls) = resolve_row_level_writer_options(session, node)?;
 
     let merge_projection = IcebergMergeRowProjection::try_new(write_plan.schema())?;
     let data_rows_schema = merge_projection.data_schema();
@@ -91,13 +92,15 @@ async fn plan_iceberg_merge_on_read(
     )?);
 
     Ok(Arc::new(
-        IcebergCommitExec::new(
-            writer,
-            table_url,
-            writer_options.lakehouse_table.clone(),
-            SnapshotUpdateKind::RowDelta,
-        )
-        .with_expected_snapshot_id(node.expected_snapshot_id()),
+        controls.apply(
+            IcebergCommitExec::new(
+                writer,
+                table_url,
+                writer_options.lakehouse_table.clone(),
+                SnapshotUpdateKind::RowDelta,
+            )
+            .with_expected_snapshot_id(node.expected_snapshot_id()),
+        ),
     ))
 }
 
@@ -129,7 +132,7 @@ async fn plan_iceberg_copy_on_write(
         return Ok(plan);
     }
     let partition_columns = IcebergLakeSource::partition_columns_from_metadata(&table)?;
-    let writer_options = resolve_row_level_writer_options(session, node)?;
+    let (writer_options, controls) = resolve_row_level_writer_options(session, node)?;
     let distribution_key = match node.command() {
         RowLevelCommand::Delete => "write.delete.distribution-mode",
         RowLevelCommand::Update => "write.update.distribution-mode",
@@ -177,13 +180,15 @@ async fn plan_iceberg_copy_on_write(
         SnapshotUpdateKind::RowLevelRewrite
     };
     Ok(Arc::new(
-        IcebergCommitExec::new(
-            writer,
-            table_url,
-            writer_options.lakehouse_table.clone(),
-            snapshot_update_kind,
-        )
-        .with_expected_snapshot_id(node.expected_snapshot_id()),
+        controls.apply(
+            IcebergCommitExec::new(
+                writer,
+                table_url,
+                writer_options.lakehouse_table.clone(),
+                snapshot_update_kind,
+            )
+            .with_expected_snapshot_id(node.expected_snapshot_id()),
+        ),
     ))
 }
 
@@ -203,7 +208,7 @@ async fn plan_metadata_delete(
     else {
         return Ok(None);
     };
-    let writer_options = resolve_row_level_writer_options(session, node)?;
+    let (writer_options, controls) = resolve_row_level_writer_options(session, node)?;
     let partition_columns = IcebergLakeSource::partition_columns_from_metadata(table)?;
     let schema = table.metadata().current_schema().ok_or_else(|| {
         datafusion_common::plan_datafusion_err!("Iceberg table metadata is missing current schema")
@@ -229,13 +234,15 @@ async fn plan_metadata_delete(
     })?;
     let input = MemorySourceConfig::try_new_exec(&[vec![batch.clone()]], batch.schema(), None)?;
     Ok(Some(Arc::new(
-        IcebergCommitExec::new(
-            input,
-            table_url.clone(),
-            writer_options.lakehouse_table,
-            SnapshotUpdateKind::RowLevelRewrite,
-        )
-        .with_expected_snapshot_id(node.expected_snapshot_id()),
+        controls.apply(
+            IcebergCommitExec::new(
+                input,
+                table_url.clone(),
+                writer_options.lakehouse_table,
+                SnapshotUpdateKind::RowLevelRewrite,
+            )
+            .with_expected_snapshot_id(node.expected_snapshot_id()),
+        ),
     )))
 }
 
@@ -250,20 +257,101 @@ fn ensure_current_row_level_mode(table: &Table, node: &RowLevelWriteNode) -> Res
     Ok(())
 }
 
+/// The caller's controls for the commit of a row-level command, kept with the command's plan.
+#[derive(Debug)]
+struct RowLevelCommitControls {
+    snapshot_properties: Vec<(String, String)>,
+    caller_expected_snapshot_id: Option<i64>,
+}
+
+impl RowLevelCommitControls {
+    fn apply(self, commit: IcebergCommitExec) -> IcebergCommitExec {
+        commit
+            .with_caller_expected_snapshot_id(self.caller_expected_snapshot_id)
+            .with_snapshot_properties(self.snapshot_properties)
+    }
+}
+
+/// Refuses a caller snapshot expectation that the snapshot the command was planned on cannot
+/// meet, before any file is written.
+fn check_caller_expected_snapshot(
+    caller_expected_snapshot_id: Option<i64>,
+    planned_snapshot_id: Option<Option<i64>>,
+) -> Result<()> {
+    let Some(expected_snapshot_id) = caller_expected_snapshot_id else {
+        return Ok(());
+    };
+    let Some(planned_snapshot_id) = planned_snapshot_id else {
+        return plan_err!(
+            "Iceberg expected snapshot {expected_snapshot_id} cannot be checked: the row-level \
+             command recorded no planned snapshot"
+        );
+    };
+    if planned_snapshot_id == Some(expected_snapshot_id) {
+        return Ok(());
+    }
+    let planned_snapshot_id = planned_snapshot_id
+        .map(|snapshot_id| snapshot_id.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    plan_err!(
+        "Iceberg expected snapshot {expected_snapshot_id} does not match current snapshot {planned_snapshot_id}"
+    )
+}
+
 fn resolve_row_level_writer_options(
     session: &dyn Session,
     node: &RowLevelWriteNode,
-) -> Result<IcebergWriterExecOptions> {
+) -> Result<(IcebergWriterExecOptions, RowLevelCommitControls)> {
+    let (options, snapshot_properties) =
+        extract_snapshot_properties(node.target_options().to_vec())?;
     let (clean_options, table_properties) =
-        split_iceberg_write_options_and_table_properties(node.target_options().to_vec())?;
+        split_iceberg_write_options_and_table_properties(options)?;
     let variant_presence =
         IcebergWriterExecOptions::variant_shredding_option_presence(&clean_options);
     let iceberg_options = IcebergWriteOptions::resolve(session, clean_options)?;
+    let caller_expected_snapshot_id = iceberg_options.caller_expected_snapshot_id;
+    check_caller_expected_snapshot(caller_expected_snapshot_id, node.expected_snapshot_id())?;
     let mut writer_options = IcebergWriterExecOptions::from(iceberg_options);
     writer_options.apply_variant_shredding_option_presence(variant_presence);
     writer_options.table_properties = table_properties;
     writer_options.lakehouse_table = node.target_lakehouse_table().cloned();
     // DELETE reports the rows it removed, whichever write path executes it.
     writer_options.count_deleted_rows = node.command() == RowLevelCommand::Delete;
-    Ok(writer_options)
+    let controls = RowLevelCommitControls {
+        snapshot_properties,
+        caller_expected_snapshot_id,
+    };
+    Ok((writer_options, controls))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn caller_expected_snapshot_must_be_the_planned_snapshot() {
+        assert!(check_caller_expected_snapshot(None, Some(Some(7))).is_ok());
+        assert!(check_caller_expected_snapshot(None, None).is_ok());
+        assert!(check_caller_expected_snapshot(Some(7), Some(Some(7))).is_ok());
+        let unplanned = check_caller_expected_snapshot(Some(7), None)
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+        assert!(
+            unplanned.contains("recorded no planned snapshot"),
+            "{unplanned}"
+        );
+        for (planned, shown) in [(Some(Some(8)), "8"), (Some(None), "none")] {
+            let error = check_caller_expected_snapshot(Some(7), planned)
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_default();
+            assert!(
+                error.contains(&format!(
+                    "Iceberg expected snapshot 7 does not match current snapshot {shown}"
+                )),
+                "{error}"
+            );
+        }
+    }
 }

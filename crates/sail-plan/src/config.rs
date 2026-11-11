@@ -74,6 +74,13 @@ pub struct PlanConfig {
     /// Whether `COUNT()` is accepted with no arguments. Spark's legacy behavior returns zero;
     /// it does not interpret the call as `COUNT(*)`.
     pub legacy_allow_parameterless_count: bool,
+    /// Iceberg snapshot summary properties set for the session through
+    /// `spark.sql.iceberg.snapshot-property.<key>`, in key order. Every Iceberg commit carries
+    /// them; a `snapshot-property.<key>` write option with the same key takes precedence.
+    pub iceberg_snapshot_properties: Vec<(String, String)>,
+    /// The snapshot that the target of an Iceberg row-level command must be at when the command
+    /// is planned and when it commits (`spark.sail.iceberg.expected-snapshot-id`).
+    pub iceberg_row_level_expected_snapshot_id: Option<String>,
 }
 
 impl PlanConfig {
@@ -110,6 +117,8 @@ impl Default for PlanConfig {
             shuffle_partitions: 200,
             tvf_allow_multiple_table_arguments: false,
             legacy_allow_parameterless_count: false,
+            iceberg_snapshot_properties: vec![],
+            iceberg_row_level_expected_snapshot_id: None,
         }
     }
 }

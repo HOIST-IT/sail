@@ -201,6 +201,43 @@ impl WritePlanBuilder {
     }
 }
 
+const SNAPSHOT_PROPERTY_OPTION_PREFIX: &str = "snapshot-property.";
+
+/// The snapshot property key of a `snapshot-property.<key>` write option.
+fn snapshot_property_option_key(option: &str) -> Option<&str> {
+    option
+        .get(..SNAPSHOT_PROPERTY_OPTION_PREFIX.len())
+        .filter(|prefix| prefix.eq_ignore_ascii_case(SNAPSHOT_PROPERTY_OPTION_PREFIX))
+        .and_then(|_| option.get(SNAPSHOT_PROPERTY_OPTION_PREFIX.len()..))
+}
+
+/// The session's Iceberg snapshot properties as an option layer of one write, without the
+/// properties that the write's own options set, since those take precedence.
+fn session_snapshot_property_layer(
+    session_properties: &[(String, String)],
+    options: &[OptionLayer],
+) -> Option<OptionLayer> {
+    let is_set_by_write = |key: &str| {
+        options.iter().any(|layer| match layer {
+            OptionLayer::OptionList { items } => items
+                .iter()
+                .any(|(option, _)| snapshot_property_option_key(option) == Some(key)),
+            _ => false,
+        })
+    };
+    let items = session_properties
+        .iter()
+        .filter(|(key, _)| !is_set_by_write(key))
+        .map(|(key, value)| {
+            (
+                format!("{SNAPSHOT_PROPERTY_OPTION_PREFIX}{key}"),
+                value.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    (!items.is_empty()).then_some(OptionLayer::OptionList { items })
+}
+
 fn has_direct_option(options: &[OptionLayer], expected_key: &str) -> bool {
     options.iter().any(|layer| match layer {
         OptionLayer::OptionList { items } => items
@@ -588,6 +625,14 @@ impl PlanResolver<'_> {
                     },
                 );
             }
+        }
+        if write_format.eq_ignore_ascii_case("iceberg")
+            && let Some(layer) = session_snapshot_property_layer(
+                &self.config.iceberg_snapshot_properties,
+                &sink_info.options,
+            )
+        {
+            sink_info.options.insert(0, layer);
         }
         sink_info.input = input;
         let registry = self.ctx.extension::<DataSourceRegistry>()?;
@@ -2045,6 +2090,43 @@ mod tests {
 
         assert_eq!(result, "catalog-result");
         assert!(lookup_called.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn write_snapshot_property_options_take_precedence_over_the_session() {
+        let session = [
+            ("Run".to_string(), "session-run".to_string()),
+            ("job".to_string(), "session-job".to_string()),
+            ("run".to_string(), "session-lower-run".to_string()),
+        ];
+        let options = vec![
+            OptionLayer::TablePropertyList {
+                items: vec![("snapshot-property.job".to_string(), "table".to_string())],
+            },
+            OptionLayer::OptionList {
+                items: vec![("SNAPSHOT-PROPERTY.Run".to_string(), "write-run".to_string())],
+            },
+        ];
+
+        let layer = session_snapshot_property_layer(&session, &options)
+            .expect("session properties the write does not set");
+
+        assert_eq!(
+            layer,
+            OptionLayer::OptionList {
+                items: vec![
+                    (
+                        "snapshot-property.job".to_string(),
+                        "session-job".to_string()
+                    ),
+                    (
+                        "snapshot-property.run".to_string(),
+                        "session-lower-run".to_string()
+                    ),
+                ]
+            }
+        );
+        assert_eq!(session_snapshot_property_layer(&[], &options), None);
     }
 
     #[test]
