@@ -22,6 +22,7 @@ use crate::table::files::{EntrySelection, SnapshotScope, manifest_entries};
 pub(crate) enum MetadataScanSource {
     TableMetadata,
     ManifestEntries {
+        #[serde(default)]
         snapshot: SnapshotScope,
         groups: Vec<Vec<ManifestFile>>,
         selection: EntrySelection,

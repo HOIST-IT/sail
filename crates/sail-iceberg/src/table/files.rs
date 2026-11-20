@@ -12,8 +12,9 @@ use crate::spec::{
     ManifestStatus, TableMetadata,
 };
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
 pub(crate) enum SnapshotScope {
+    #[default]
     Current,
     Id(i64),
     All,

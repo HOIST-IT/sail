@@ -6168,28 +6168,43 @@ mod tests {
             DataType::Utf8,
             false,
         )]));
-        let scan = serde_json::json!({
-            "table_url": "s3://bucket/table",
-            "metadata_location": "s3://bucket/table/metadata/v7.metadata.json",
-            "relation": "Files", "source": {"ManifestEntries": {
-                "groups": [[], []],
-                "selection": {"statuses": ["ADDED", "EXISTING"], "content": null}
-            }},
-            "projection": [0], "limit": 12
-        });
-        let metadata = IcebergMetadataRelationExec::try_from_serialized(schema, &scan.to_string())?;
-        let expected_scan = metadata.serialized_scan()?;
         let codec = RemoteExecutionCodec;
-        let bytes = try_encode_physical_plan(&codec, Arc::new(metadata))?;
-        let decoded = try_decode_physical_plan(&TaskContext::default(), &codec, &bytes)?;
-        let decoded = decoded
-            .downcast_ref::<IcebergMetadataRelationExec>()
-            .ok_or_else(|| plan_datafusion_err!("expected metadata relation scan"))?;
-        assert_eq!(decoded.serialized_scan()?, expected_scan);
-        assert_eq!(
-            decoded.properties().output_partitioning().partition_count(),
-            2
-        );
+        for (relation, snapshot) in [
+            ("Files", serde_json::json!("Current")),
+            ("Entries", serde_json::json!({"Id": 42})),
+        ] {
+            let scan = serde_json::json!({
+                "table_url": "s3://bucket/table",
+                "metadata_location": "s3://bucket/table/metadata/v7.metadata.json",
+                "relation": relation, "source": {"ManifestEntries": {
+                    "snapshot": snapshot,
+                    "groups": [[], []],
+                    "selection": {"statuses": ["ADDED", "EXISTING"], "content": null}
+                }},
+                "projection": [0], "limit": 12
+            });
+            let metadata = IcebergMetadataRelationExec::try_from_serialized(
+                schema.clone(),
+                &scan.to_string(),
+            )?;
+            let expected_scan = metadata.serialized_scan()?;
+            let bytes = try_encode_physical_plan(&codec, Arc::new(metadata))?;
+            let decoded = try_decode_physical_plan(&TaskContext::default(), &codec, &bytes)?;
+            let decoded = decoded
+                .downcast_ref::<IcebergMetadataRelationExec>()
+                .ok_or_else(|| plan_datafusion_err!("expected metadata relation scan"))?;
+            assert_eq!(decoded.serialized_scan()?, expected_scan);
+            let decoded_scan: serde_json::Value = serde_json::from_str(&decoded.serialized_scan()?)
+                .map_err(|error| datafusion::common::DataFusionError::External(Box::new(error)))?;
+            assert_eq!(
+                decoded_scan["source"]["ManifestEntries"]["snapshot"],
+                snapshot
+            );
+            assert_eq!(
+                decoded.properties().output_partitioning().partition_count(),
+                2
+            );
+        }
 
         let default = sail_common_datafusion::schema_evolution::encode_field_default(
             &ScalarValue::Utf8(Some("x".into())),
