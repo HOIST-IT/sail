@@ -15,6 +15,7 @@ use crate::spec::{
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub(crate) enum SnapshotScope {
     Current,
+    Id(i64),
     All,
 }
 
@@ -40,6 +41,17 @@ impl EntrySelection {
         }
     }
 
+    pub(crate) fn all() -> Self {
+        Self {
+            statuses: vec![
+                ManifestStatus::Added,
+                ManifestStatus::Existing,
+                ManifestStatus::Deleted,
+            ],
+            content: None,
+        }
+    }
+
     pub(crate) fn matches(&self, entry: &ManifestEntry) -> bool {
         self.statuses.contains(&entry.status)
             && self
@@ -56,6 +68,15 @@ pub(crate) async fn scan_manifests(
 ) -> Result<Vec<ManifestFile>> {
     let snapshots = match scope.snapshots {
         SnapshotScope::Current => metadata.current_snapshot().into_iter().collect::<Vec<_>>(),
+        SnapshotScope::Id(id) => vec![
+            metadata
+                .snapshots
+                .iter()
+                .find(|snapshot| snapshot.snapshot_id() == id)
+                .ok_or_else(|| {
+                    datafusion::common::plan_datafusion_err!("Snapshot with id {id} not found")
+                })?,
+        ],
         SnapshotScope::All => metadata.snapshots.iter().collect(),
     };
     let mut paths = HashSet::new();

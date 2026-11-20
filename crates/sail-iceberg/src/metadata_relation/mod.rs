@@ -1,5 +1,6 @@
 //! Iceberg metadata relations.
 
+pub(crate) mod entries;
 pub(crate) mod files;
 mod history;
 mod kind;
@@ -10,6 +11,9 @@ mod refs;
 mod snapshots;
 mod time;
 
+#[cfg(test)]
+mod entries_tests;
+
 pub(crate) use kind::IcebergMetadataRelationType;
 pub(crate) use provider::metadata_relation_provider;
 
@@ -18,6 +22,7 @@ pub(crate) use provider::metadata_relation_provider;
 mod tests {
     use std::collections::HashMap;
 
+    use crate::options::ResolveOptions;
     use datafusion::arrow::array::{Array, BooleanArray, Int64Array, StringArray};
     use datafusion::arrow::datatypes::DataType;
     use datafusion::common::Result;
@@ -50,7 +55,7 @@ mod tests {
         builder.build().expect("valid test snapshot")
     }
 
-    fn table_metadata() -> TableMetadata {
+    pub(super) fn table_metadata() -> TableMetadata {
         let schema = Schema::builder()
             .with_schema_id(7)
             .build()
@@ -220,6 +225,7 @@ mod tests {
             url.clone(),
             Some("memory://bucket/table/metadata/v1.metadata.json".to_string()),
             IcebergMetadataRelationType::Files,
+            &crate::options::r#gen::IcebergReadOptions::resolve(&driver.state(), vec![])?,
         )
         .await?;
         // Manifests do not exist until after planning.
@@ -500,7 +506,7 @@ mod tests {
                     .is_supported()
             );
         }
-        for name in ["entries", "position_deletes"] {
+        for name in ["position_deletes"] {
             assert!(
                 !IcebergMetadataRelationType::parse(name)
                     .expect("recognized deferred metadata table")

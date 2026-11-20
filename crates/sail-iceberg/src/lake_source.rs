@@ -162,7 +162,11 @@ impl LakeRelationProvider for IcebergLakeSource {
             LakeRelationResolution::Supported(LakeRelation::new(
                 relation_type.name(),
                 LakeRelationAccess::MetadataRead,
-                LakeRelationTimeTravel::Unsupported,
+                if relation_type == IcebergMetadataRelationType::Entries {
+                    LakeRelationTimeTravel::Supported
+                } else {
+                    LakeRelationTimeTravel::Unsupported
+                },
             ))
         } else {
             LakeRelationResolution::Unsupported {
@@ -189,8 +193,14 @@ impl LakeRelationProvider for IcebergLakeSource {
         }
         let read = resolve_iceberg_read(ctx, info, IcebergReadPurpose::MetadataRelation).await?;
         Ok(datafusion::datasource::provider_as_source(
-            metadata_relation_provider(ctx, read.table_url, read.metadata_location, relation_type)
-                .await?,
+            metadata_relation_provider(
+                ctx,
+                read.table_url,
+                read.metadata_location,
+                relation_type,
+                &read.options,
+            )
+            .await?,
         ))
     }
 }
