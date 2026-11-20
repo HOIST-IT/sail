@@ -13,15 +13,17 @@ use datafusion::physical_plan::{
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::metadata_relation::{IcebergMetadataRelationType, files};
+use crate::metadata_relation::{IcebergMetadataRelationType, entries, files};
 use crate::spec::ManifestFile;
 use crate::table::Table;
-use crate::table::files::{EntrySelection, manifest_entries};
+use crate::table::files::{EntrySelection, SnapshotScope, manifest_entries};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum MetadataScanSource {
     TableMetadata,
     ManifestEntries {
+        #[serde(default)]
+        snapshot: SnapshotScope,
         groups: Vec<Vec<ManifestFile>>,
         selection: EntrySelection,
     },
@@ -64,7 +66,10 @@ impl IcebergMetadataRelationExec {
             return plan_err!("Invalid Iceberg metadata relation scan");
         }
         if matches!(scan.source, MetadataScanSource::ManifestEntries { .. })
-            != (scan.relation == IcebergMetadataRelationType::Files)
+            != matches!(
+                scan.relation,
+                IcebergMetadataRelationType::Files | IcebergMetadataRelationType::Entries
+            )
         {
             return plan_err!("Iceberg metadata relation does not match its scan source");
         }
@@ -155,15 +160,29 @@ impl ExecutionPlan for IcebergMetadataRelationExec {
                 let table = Table::load_with_metadata_location(context.runtime_env().as_ref(), table_url,
                     Some(scan.metadata_location.clone())).await?;
                 let mut remaining = scan.limit.unwrap_or(usize::MAX);
-                if let MetadataScanSource::ManifestEntries { groups, selection } = &scan.source {
-                    let projection = files::FilesProjection::try_new(table.metadata(), &scan.projection)?;
+                if let MetadataScanSource::ManifestEntries { snapshot, groups, selection } = &scan.source {
+                    if let SnapshotScope::Id(id) = snapshot
+                        && !table.metadata().snapshots.iter().any(|snapshot| snapshot.snapshot_id() == *id) {
+                        Err(datafusion::common::exec_datafusion_err!("Snapshot with id {id} not found in pinned metadata"))?;
+                    }
+                    let entry_projection = if scan.relation == IcebergMetadataRelationType::Entries {
+                        Some(entries::EntriesProjection::try_new(table.metadata(), &scan.projection)?)
+                    } else { None };
+                    let file_projection = if entry_projection.is_none() {
+                        Some(files::FilesProjection::try_new(table.metadata(), &scan.projection)?)
+                    } else { None };
                     'manifests: for manifest in &groups[partition] {
-                        let files = manifest_entries(table.store_context(), manifest).await?
-                            .into_iter().filter(|entry| selection.matches(entry))
-                            .map(|entry| entry.data_file).collect::<Vec<_>>();
-                        for chunk in files.chunks(batch_size) {
+                        let entries = manifest_entries(table.store_context(), manifest).await?
+                            .into_iter().filter(|entry| selection.matches(entry)).collect::<Vec<_>>();
+                        for chunk in entries.chunks(batch_size) {
                             let count = chunk.len().min(remaining);
-                            let batch = projection.batch(&chunk[..count])?;
+                            let batch = if let Some(projection) = &entry_projection {
+                                projection.batch(&chunk[..count])?
+                            } else if let Some(projection) = &file_projection {
+                                projection.batch(&chunk[..count].iter().map(|entry| entry.data_file.clone()).collect::<Vec<_>>())?
+                            } else {
+                                Err(datafusion::common::internal_datafusion_err!("Missing metadata projection"))?
+                            };
                             yield batch;
                             remaining -= count;
                             if remaining == 0 { break 'manifests; }

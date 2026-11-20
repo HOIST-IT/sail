@@ -182,7 +182,6 @@ def test_iceberg_metadata_tables(spark, tmp_path):
         assert [row.snapshot_id for row in fully_qualified] == [row.snapshot_id for row in snapshots]
 
         unsupported_metadata_tables = [
-            "entries",
             "data_files",
             "delete_files",
             "partitions",

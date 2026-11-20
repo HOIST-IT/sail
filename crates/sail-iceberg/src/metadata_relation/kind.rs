@@ -99,7 +99,8 @@ impl IcebergMetadataRelationType {
     pub(crate) fn is_supported(self) -> bool {
         matches!(
             self,
-            Self::Files
+            Self::Entries
+                | Self::Files
                 | Self::History
                 | Self::MetadataLogEntries
                 | Self::Snapshots
@@ -122,7 +123,7 @@ impl IcebergMetadataRelationType {
             Self::Snapshots => snapshots::schema(),
             Self::Refs => refs::schema(),
             Self::Manifests => manifests::schema(),
-            Self::Files => Arc::new(ArrowSchema::empty()),
+            Self::Entries | Self::Files => Arc::new(ArrowSchema::empty()),
             unsupported => Arc::new(ArrowSchema::new_with_metadata(
                 Vec::<Field>::new(),
                 HashMap::from([("unsupported".to_string(), unsupported.name().to_string())]),
@@ -139,8 +140,8 @@ impl IcebergMetadataRelationType {
             Self::Refs => refs::batch(table.metadata()),
             Self::Snapshots => snapshots::batch(table.metadata()),
             Self::Manifests => manifests::batch(table).await,
-            Self::Files => Err(datafusion::common::DataFusionError::Internal(
-                "files requires a manifest scan".to_string(),
+            Self::Entries | Self::Files => Err(datafusion::common::DataFusionError::Internal(
+                "entries and files require a manifest scan".to_string(),
             )),
             unsupported => Err(datafusion::common::DataFusionError::NotImplemented(
                 unsupported.unsupported_reason(),

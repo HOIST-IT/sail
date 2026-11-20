@@ -8,7 +8,8 @@ use datafusion::logical_expr::{Expr, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use url::Url;
 
-use super::{IcebergMetadataRelationType, files};
+use super::{IcebergMetadataRelationType, entries, files};
+use crate::options::r#gen::IcebergReadOptions;
 use crate::physical_plan::metadata_relation_exec::{
     IcebergMetadataRelationExec, MetadataRelationScan, MetadataScanSource,
 };
@@ -22,6 +23,7 @@ pub(crate) async fn metadata_relation_provider(
     table_url: Url,
     metadata_location: Option<String>,
     relation_type: IcebergMetadataRelationType,
+    options: &IcebergReadOptions,
 ) -> Result<Arc<dyn TableProvider>> {
     if !relation_type.is_supported() {
         return Err(DataFusionError::NotImplemented(
@@ -36,15 +38,32 @@ pub(crate) async fn metadata_relation_provider(
         )
         .await?,
     );
-    let schema = if relation_type == IcebergMetadataRelationType::Files {
-        files::schema(table.metadata())?
+    let temporal = options.snapshot_id.is_some()
+        || options.use_ref.is_some()
+        || options.timestamp_as_of.is_some();
+    if temporal && relation_type != IcebergMetadataRelationType::Entries {
+        return Err(DataFusionError::NotImplemented(format!(
+            "Time travel is not supported for Iceberg metadata table '{}'",
+            relation_type.name()
+        )));
+    }
+    let snapshot = if relation_type == IcebergMetadataRelationType::Entries
+        && (temporal || table.metadata().current_snapshot().is_some())
+    {
+        SnapshotScope::Id(table.scan_state(options)?.1.snapshot_id())
     } else {
-        relation_type.schema()
+        SnapshotScope::Current
+    };
+    let schema = match relation_type {
+        IcebergMetadataRelationType::Entries => entries::schema(table.metadata())?,
+        IcebergMetadataRelationType::Files => files::schema(table.metadata())?,
+        _ => relation_type.schema(),
     };
     Ok(Arc::new(IcebergMetadataRelationProvider {
         table,
         relation_type,
         schema,
+        snapshot,
     }))
 }
 
@@ -52,6 +71,7 @@ struct IcebergMetadataRelationProvider {
     table: Arc<Table>,
     relation_type: IcebergMetadataRelationType,
     schema: Arc<ArrowSchema>,
+    snapshot: SnapshotScope,
 }
 
 impl std::fmt::Debug for IcebergMetadataRelationProvider {
@@ -81,14 +101,18 @@ impl TableProvider for IcebergMetadataRelationProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let source = if self.relation_type == IcebergMetadataRelationType::Files {
+        let source = if matches!(
+            self.relation_type,
+            IcebergMetadataRelationType::Files | IcebergMetadataRelationType::Entries
+        ) {
             MetadataScanSource::ManifestEntries {
+                snapshot: self.snapshot,
                 groups: balance_by_size(
                     scan_manifests(
                         self.table.store_context(),
                         self.table.metadata(),
                         &ManifestScope {
-                            snapshots: SnapshotScope::Current,
+                            snapshots: self.snapshot,
                             content: None,
                         },
                     )
@@ -96,7 +120,11 @@ impl TableProvider for IcebergMetadataRelationProvider {
                     session.config().target_partitions(),
                     |manifest| manifest.manifest_length.max(0) as u64,
                 ),
-                selection: EntrySelection::live(),
+                selection: if self.relation_type == IcebergMetadataRelationType::Entries {
+                    EntrySelection::all()
+                } else {
+                    EntrySelection::live()
+                },
             }
         } else {
             MetadataScanSource::TableMetadata
