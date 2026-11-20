@@ -2,6 +2,7 @@
 members = [
     "crates/*",
 ]
+exclude = ["vendor/datafusion-physical-plan"]
 resolver = "2"
 
 [workspace.package]
@@ -224,8 +225,9 @@ hdfs-native-object-store = "0.16.0"
 ######
 
 [patch.crates-io]
-# Override dependencies to use our forked versions.
-# You can use `path = "..."` to temporarily point to your local copy of the crates to speed up local development.
+# DataFusion 55.3.0 with apache/datafusion#24891 (repartition spill deadlock).
+# Drop this override when the fix is included in our DataFusion release.
+datafusion-physical-plan = { path = "vendor/datafusion-physical-plan" }
 
 [profile.release]
 # https://doc.rust-lang.org/cargo/reference/profiles.html#release
