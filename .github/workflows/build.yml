@@ -33,6 +33,7 @@ jobs:
             package:
               - ".github/**"
               - "crates/**"
+              - "vendor/**"
               - "python/**"
               - "scripts/**"
               - "Cargo.lock"

@@ -35,6 +35,9 @@ jobs:
       - name: Run Cargo Test
         run: cargo nextest run --no-fail-fast
 
+      - name: Test vendored DataFusion spill patch
+        run: cargo test --manifest-path vendor/datafusion-physical-plan/Cargo.toml --locked --lib
+
       # Generate coverage report after unit tests (runs in PRs and pushes)
       - name: Generate Rust unit coverage report
         run: |
